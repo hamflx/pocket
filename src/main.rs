@@ -18,8 +18,7 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{
     DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetTokenInformation,
-    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_INFORMATION_CLASS, TOKEN_QUERY,
-    TOKEN_USER, TokenUser,
+    OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
@@ -81,10 +80,28 @@ struct StorageConfig {
     s3: Option<S3Config>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct MountConfig {
+    /// Optional identifier for logging / CLI
+    #[serde(default)]
+    name: Option<String>,
+    /// Local directory path to mount on, e.g. `C:\Users\alice\.ssh`
+    mount_path: String,
+    /// Name of storage backend to use
+    storage: String,
+}
+
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 struct AppConfig {
+    /// Global storage configuration (currently used by `ConfigS3` CLI)
     #[serde(default)]
     storage: StorageConfig,
+    /// Named storage backends that can be referenced from mounts
+    #[serde(default)]
+    storages: HashMap<String, StorageConfig>,
+    /// Multi-mount configuration
+    #[serde(default)]
+    mounts: Vec<MountConfig>,
 }
 
 fn config_path() -> PathBuf {
@@ -113,6 +130,90 @@ fn credentials_dir() -> PathBuf {
 
 fn credentials_file_path(name: &str) -> PathBuf {
     credentials_dir().join(format!("{name}.bin"))
+}
+
+/// Best-effort retrieval of the current user's home directory as a String.
+fn home_dir_string() -> Option<String> {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return Some(home);
+        }
+    }
+
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        if !profile.is_empty() {
+            return Some(profile);
+        }
+    }
+
+    None
+}
+
+/// Expand "~", "$HOME" and "${HOME}" in a mount path using the current user's
+/// home directory. If the home directory cannot be determined, the original
+/// string is returned unchanged.
+fn expand_mount_path(path: &str) -> String {
+    let Some(home) = home_dir_string() else {
+        return path.to_string();
+    };
+
+    // Handle leading "~" (e.g. "~/.ssh" or "~\pocket").
+    let mut expanded = if path == "~" {
+        home.clone()
+    } else if path.starts_with("~/") || path.starts_with("~\\") {
+        format!("{home}{}", &path[1..])
+    } else {
+        path.to_string()
+    };
+
+    // Substitute $HOME and ${HOME} anywhere in the path.
+    expanded = expanded.replace("$HOME", &home);
+    expanded = expanded.replace("${HOME}", &home);
+
+    expanded
+}
+
+/// Ensure the WinFsp runtime DLL is loaded when using delay-loaded linkage.
+/// This mirrors the C FspLoad behavior used in WinFsp's own tools.
+#[cfg(windows)]
+fn load_winfsp_dll() -> Result<(), Box<dyn std::error::Error>> {
+    use std::path::PathBuf;
+    use windows::Win32::System::LibraryLoader::LoadLibraryW;
+    use windows_registry::LOCAL_MACHINE;
+
+    const DLL_NAME: &str = "winfsp-x64.dll";
+
+    unsafe {
+        let dll = HSTRING::from(DLL_NAME);
+        if let Ok(module) = LoadLibraryW(&dll) {
+            if !module.is_invalid() {
+                // Loaded from standard search path.
+                return Ok(());
+            }
+        }
+    }
+
+    // Fallback: read InstallDir from HKLM\SOFTWARE\WinFsp and load from its bin\ directory.
+    let key = LOCAL_MACHINE.open("SOFTWARE\\WOW6432Node\\WinFsp")?;
+    let install_dir: String = key.get_string("InstallDir")?;
+
+    let mut path = PathBuf::from(install_dir);
+    path.push("bin");
+    path.push(DLL_NAME);
+    let dll_path = path.to_string_lossy().to_string();
+
+    unsafe {
+        let dll = HSTRING::from(dll_path);
+        match LoadLibraryW(&dll) {
+            Ok(module) if !module.is_invalid() => Ok(()),
+            _ => Err("failed to load WinFsp runtime DLL".into()),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn load_winfsp_dll() -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -272,6 +373,53 @@ fn load_config() -> AppConfig {
     }
 }
 
+fn build_volume_params() -> VolumeParams {
+    let mut params = VolumeParams::default();
+    params
+        .sector_size(512)
+        .sectors_per_allocation_unit(1)
+        .persistent_acls(true)
+        .unicode_on_disk(true)
+        .case_sensitive_search(true)
+        .case_preserved_names(true);
+    params
+}
+
+/// Build the effective list of mounts and their resolved storage backends from
+/// configuration. `storage = "memory"` is treated as a built-in in-memory
+/// backend; other storage names must be defined in `[storages.<name>]`.
+fn effective_mounts(
+    cfg: &AppConfig,
+) -> Result<Vec<(MountConfig, StorageConfig)>, Box<dyn std::error::Error>> {
+    if cfg.mounts.is_empty() {
+        return Err("no mounts configured in [mounts]".into());
+    }
+
+    let mut result = Vec::new();
+
+    for m in &cfg.mounts {
+        let storage_cfg = if m.storage.eq_ignore_ascii_case("memory") {
+            StorageConfig {
+                backend: BackendKind::Memory,
+                s3: None,
+            }
+        } else if let Some(named) = cfg.storages.get(&m.storage) {
+            named.clone()
+        } else {
+            return Err(format!(
+                "mount '{}' refers to unknown storage '{}'",
+                m.name.as_deref().unwrap_or("unnamed"),
+                m.storage
+            )
+            .into());
+        };
+
+        result.push((m.clone(), storage_cfg));
+    }
+
+    Ok(result)
+}
+
 #[derive(Debug, Clone)]
 struct MemEntry {
     is_dir: bool,
@@ -340,7 +488,8 @@ impl S3State {
         }
 
         let runtime = Runtime::new()?;
-        let shared_config = runtime.block_on(aws_config::load_from_env());
+        let shared_config =
+            runtime.block_on(aws_config::defaults(aws_config::BehaviorVersion::latest()).load());
 
         let mut s3_config_builder = aws_sdk_s3::config::Builder::from(&shared_config);
         if let Some(ref endpoint) = cfg.endpoint {
@@ -503,9 +652,7 @@ struct RemoteFilesystem {
 }
 
 impl RemoteFilesystem {
-    fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let cfg = load_config();
-
+    fn new(storage: &StorageConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let custom_sd = Self::build_user_only_security_descriptor()?;
         if let Ok(custom_sddl) = Self::sd_to_sddl(&custom_sd) {
             debug!("Custom SD SDDL : {}", custom_sddl);
@@ -525,13 +672,13 @@ impl RemoteFilesystem {
             },
         );
 
-        let mut s3 = match cfg.storage.backend {
+        let s3 = match storage.backend {
             BackendKind::Memory => {
                 info!("Using in-memory backend");
                 None
             }
             BackendKind::S3 => {
-                let s3_cfg = match cfg.storage.s3 {
+                let s3_cfg = match storage.s3 {
                     Some(ref s3_cfg) if !s3_cfg.bucket.is_empty() => Some(s3_cfg.clone()),
                     _ => {
                         warn!(
@@ -1133,7 +1280,7 @@ impl FileSystemContext for RemoteFilesystem {
             .get_mut(&context.path)
             .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
 
-        let mut write_offset = if write_to_eof {
+        let write_offset = if write_to_eof {
             entry.data.len()
         } else {
             offset as usize
@@ -1393,6 +1540,10 @@ fn handle_config_s3(args: ConfigS3Args) -> Result<(), Box<dyn std::error::Error>
         AppConfig::default()
     };
 
+    // For now, keep legacy behavior: configure the global storage backend.
+    // Multi-mount support reads from `cfg.mounts`; callers that want per-mount
+    // S3 config should edit the config file accordingly or a future dedicated
+    // CLI command can be added.
     cfg.storage.backend = BackendKind::S3;
     cfg.storage.s3 = Some(S3Config {
         bucket: args.bucket,
@@ -1418,33 +1569,37 @@ fn handle_config_s3(args: ConfigS3Args) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn run_main() -> Result<(), Box<dyn std::error::Error>> {
-    let fs = RemoteFilesystem::new()?;
-    let mut params = VolumeParams::default();
-    params
-        .sector_size(512)
-        .sectors_per_allocation_unit(1)
-        .persistent_acls(true)
-        .unicode_on_disk(true)
-        .case_sensitive_search(true)
-        .case_preserved_names(true);
+    // Ensure WinFsp DLL is loaded when using delay-load linkage.
+    load_winfsp_dll()?;
 
-    // 将虚拟文件系统挂载到当前用户的 .ssh 目录上。
-    // 挂载期间，该目录原有内容会被隐藏，卸载后恢复。
-    let user_profile =
-        std::env::var("USERPROFILE").unwrap_or_else(|_| String::from(r"C:\Users\Public"));
-    let mount_point = format!(r"{}\{}", user_profile, r"\.ssh");
+    let cfg = load_config();
+    let mounts = effective_mounts(&cfg)?;
 
-    info!("Mounting at {}...", mount_point);
-    let mut host = FileSystemHost::new(params, fs)?;
-    host.mount(mount_point)?;
-    host.start()?;
+    let mut hosts: Vec<FileSystemHost<RemoteFilesystem>> = Vec::new();
 
-    info!("Mounted. Press ENTER to stop.");
+    for (m, storage) in mounts {
+        let mount_path = expand_mount_path(&m.mount_path);
+        info!(
+            "Initializing mount: name={:?}, path={}, backend={:?}",
+            m.name, mount_path, storage.backend
+        );
+
+        let fs = RemoteFilesystem::new(&storage)?;
+        let params = build_volume_params();
+        let mut host = FileSystemHost::new(params, fs)?;
+        host.mount(&mount_path)?;
+        host.start()?;
+        hosts.push(host);
+    }
+
+    info!("All mounts started. Press ENTER to stop.");
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
 
-    host.stop();
-    host.unmount();
+    for mut host in hosts {
+        host.stop();
+        host.unmount();
+    }
 
     Ok(())
 }
@@ -1515,10 +1670,15 @@ fn main() {
 
 #[test]
 fn test_open_file() {
-    let user_profile =
-        std::env::var("USERPROFILE").unwrap_or_else(|_| String::from(r"C:\Users\Public"));
-    let path = format!(r"{}\{}", user_profile, r"\.ssh\id_ed25519");
-    std::fs::read_to_string(&path).unwrap();
-    let content = std::fs::read_to_string(path).unwrap();
-    assert_eq!(content, "hello world");
+    // Basic sanity: storage = "memory" is treated as built-in memory backend.
+    let toml_str = r#"
+        [[mounts]]
+        name = "mem"
+        mount_path = "C:\\Users\\alice\\pocket-tmp"
+        storage = "memory"
+    "#;
+    let cfg: AppConfig = toml::from_str(toml_str).unwrap();
+    let mounts = effective_mounts(&cfg).unwrap();
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].0.name.as_deref(), Some("mem"));
 }

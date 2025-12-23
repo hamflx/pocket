@@ -1752,6 +1752,7 @@ dependencies = [
  "tracing-subscriber",
  "widestring",
  "windows",
+ "windows-registry",
  "winfsp",
  "winfsp-sys",
 ]
