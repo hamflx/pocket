@@ -422,6 +422,41 @@ struct MemEntry {
     is_dir: bool,
     data: Vec<u8>,
     attributes: u32,
+    creation_time: u64,
+    last_access_time: u64,
+    last_write_time: u64,
+    change_time: u64,
+}
+
+impl MemEntry {
+    /// Fill a FileInfo struct with this entry's metadata
+    fn fill_file_info(&self, file_info: &mut FileInfo) {
+        file_info.file_attributes = self.attributes;
+        if self.is_dir {
+            file_info.file_size = 0;
+            file_info.allocation_size = 0;
+        } else {
+            let size = self.data.len() as u64;
+            file_info.file_size = size;
+            file_info.allocation_size = size;
+        }
+        file_info.creation_time = self.creation_time;
+        file_info.last_access_time = self.last_access_time;
+        file_info.last_write_time = self.last_write_time;
+        file_info.change_time = self.change_time;
+    }
+}
+
+/// Get current time as Windows FILETIME (100-nanosecond intervals since January 1, 1601)
+fn current_filetime() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Difference between Windows FILETIME epoch (1601-01-01) and Unix epoch (1970-01-01)
+    const FILETIME_UNIX_DIFF: u64 = 116444736000000000;
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let ticks = duration.as_secs() * 10_000_000 + duration.subsec_nanos() as u64 / 100;
+    ticks + FILETIME_UNIX_DIFF
 }
 
 #[derive(Debug)]
@@ -663,12 +698,17 @@ impl RemoteFilesystem {
         let security_descriptor = custom_sd;
         let mut map = HashMap::new();
 
+        let now = current_filetime();
         map.insert(
             "\\".to_string(),
             MemEntry {
                 is_dir: true,
                 data: Vec::new(),
                 attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                creation_time: now,
+                last_access_time: now,
+                last_write_time: now,
+                change_time: now,
             },
         );
 
@@ -752,6 +792,7 @@ impl RemoteFilesystem {
             return;
         }
 
+        let now = current_filetime();
         for (key, data) in objects {
             if let Some(path) = s3.key_to_path(&key) {
                 Self::ensure_parent_directories(entries, &path);
@@ -761,6 +802,10 @@ impl RemoteFilesystem {
                         is_dir: false,
                         data,
                         attributes: FILE_ATTRIBUTE_ARCHIVE.0 | FILE_ATTRIBUTE_NORMAL.0,
+                        creation_time: now,
+                        last_access_time: now,
+                        last_write_time: now,
+                        change_time: now,
                     },
                 );
             }
@@ -789,10 +834,15 @@ impl RemoteFilesystem {
                 current = format!(r"{}\{}", current, part);
             }
 
+            let now = current_filetime();
             entries.entry(current.clone()).or_insert(MemEntry {
                 is_dir: true,
                 data: Vec::new(),
                 attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                creation_time: now,
+                last_access_time: now,
+                last_write_time: now,
+                change_time: now,
             });
         }
     }
@@ -966,15 +1016,7 @@ impl FileSystemContext for RemoteFilesystem {
         let entries = self.entries.read().unwrap();
         if let Some(entry) = entries.get(&path) {
             let fi = file_info.as_mut();
-            fi.file_attributes = entry.attributes;
-            if entry.is_dir {
-                fi.file_size = 0;
-                fi.allocation_size = 0;
-            } else {
-                let size = entry.data.len() as u64;
-                fi.file_size = size;
-                fi.allocation_size = size;
-            }
+            entry.fill_file_info(fi);
             fi.index_number = 0;
             fi.hard_links = 0;
 
@@ -995,6 +1037,26 @@ impl FileSystemContext for RemoteFilesystem {
     }
 
     fn close(&self, _context: Self::FileContext) {}
+
+    fn flush(
+        &self,
+        context: Option<&Self::FileContext>,
+        file_info: &mut FileInfo,
+    ) -> Result<(), FspError> {
+        if let Some(ctx) = context {
+            debug!("flush: {}", ctx.path);
+            let entries = self.entries.read().unwrap();
+            if let Some(entry) = entries.get(&ctx.path) {
+                entry.fill_file_info(file_info);
+            }
+        } else {
+            debug!("flush: volume flush");
+        }
+
+        // For in-memory filesystem, flush is always successful
+        // For S3 backend, data is already uploaded in write()
+        Ok(())
+    }
 
     fn create(
         &self,
@@ -1030,10 +1092,15 @@ impl FileSystemContext for RemoteFilesystem {
             return Err(FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
 
+        let now = current_filetime();
         let entry = entries.entry(path.clone()).or_insert(MemEntry {
             is_dir,
             data: Vec::new(),
             attributes: file_attributes,
+            creation_time: now,
+            last_access_time: now,
+            last_write_time: now,
+            change_time: now,
         });
 
         entry.is_dir = is_dir;
@@ -1041,15 +1108,13 @@ impl FileSystemContext for RemoteFilesystem {
         if !is_dir {
             entry.data.clear();
         }
+        // Update timestamps on create/overwrite
+        entry.last_access_time = now;
+        entry.last_write_time = now;
+        entry.change_time = now;
 
         let fi = file_info.as_mut();
-        fi.file_attributes = entry.attributes;
-        fi.file_size = if entry.is_dir {
-            0
-        } else {
-            entry.data.len() as u64
-        };
-        fi.allocation_size = fi.file_size;
+        entry.fill_file_info(fi);
         fi.index_number = 0;
         fi.hard_links = 0;
 
@@ -1111,15 +1176,7 @@ impl FileSystemContext for RemoteFilesystem {
 
         let entries = self.entries.read().unwrap();
         if let Some(entry) = entries.get(&context.path) {
-            out_file_info.file_attributes = entry.attributes;
-            if entry.is_dir {
-                out_file_info.file_size = 0;
-                out_file_info.allocation_size = 0;
-            } else {
-                let size = entry.data.len() as u64;
-                out_file_info.file_size = size;
-                out_file_info.allocation_size = size;
-            }
+            entry.fill_file_info(out_file_info);
             debug!("get_file_info: file_info: {:?}", out_file_info);
         } else {
             debug!("get_file_info: not found");
@@ -1179,6 +1236,53 @@ impl FileSystemContext for RemoteFilesystem {
         Ok(())
     }
 
+    fn set_basic_info(
+        &self,
+        context: &Self::FileContext,
+        file_attributes: u32,
+        creation_time: u64,
+        last_access_time: u64,
+        last_write_time: u64,
+        change_time: u64,
+        file_info: &mut FileInfo,
+    ) -> Result<(), FspError> {
+        debug!(
+            "set_basic_info: {} attrs={} ct={} lat={} lwt={} cht={}",
+            context.path,
+            file_attributes,
+            creation_time,
+            last_access_time,
+            last_write_time,
+            change_time
+        );
+
+        let mut entries = self.entries.write().unwrap();
+        let entry = entries
+            .get_mut(&context.path)
+            .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+
+        // INVALID_FILE_ATTRIBUTES (0xFFFFFFFF) means "don't change"
+        if file_attributes != u32::MAX {
+            entry.attributes = file_attributes;
+        }
+        // 0 means "don't change" for timestamps
+        if creation_time != 0 {
+            entry.creation_time = creation_time;
+        }
+        if last_access_time != 0 {
+            entry.last_access_time = last_access_time;
+        }
+        if last_write_time != 0 {
+            entry.last_write_time = last_write_time;
+        }
+        if change_time != 0 {
+            entry.change_time = change_time;
+        }
+
+        entry.fill_file_info(file_info);
+        Ok(())
+    }
+
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> Result<(), FspError> {
         debug!("get_volume_info");
         // Report a simple fixed-size in-memory volume.
@@ -1210,10 +1314,12 @@ impl FileSystemContext for RemoteFilesystem {
         let new_len = new_size as usize;
         entry.data.resize(new_len, 0);
 
-        let size = entry.data.len() as u64;
-        file_info.file_attributes = entry.attributes;
-        file_info.file_size = size;
-        file_info.allocation_size = size;
+        // Update timestamps on size change
+        let now = current_filetime();
+        entry.last_write_time = now;
+        entry.change_time = now;
+
+        entry.fill_file_info(file_info);
         Ok(())
     }
 
@@ -1295,10 +1401,13 @@ impl FileSystemContext for RemoteFilesystem {
             entry.data[write_offset..write_offset + write_len]
                 .copy_from_slice(&buffer[..write_len]);
 
-            let size = entry.data.len() as u64;
-            file_info.file_attributes = entry.attributes;
-            file_info.file_size = size;
-            file_info.allocation_size = size;
+            // Update timestamps on write
+            let now = current_filetime();
+            entry.last_access_time = now;
+            entry.last_write_time = now;
+            entry.change_time = now;
+
+            entry.fill_file_info(file_info);
             return Ok(write_len as u32);
         }
 
@@ -1307,16 +1416,20 @@ impl FileSystemContext for RemoteFilesystem {
             entry.data.resize(end, 0);
         }
         entry.data[write_offset..write_offset + buffer.len()].copy_from_slice(buffer);
+
+        // Update timestamps on write
+        let now = current_filetime();
+        entry.last_access_time = now;
+        entry.last_write_time = now;
+        entry.change_time = now;
+
         if let Some(s3) = &self.s3 {
             if let Some(key) = s3.path_to_key(&context.path) {
                 s3.upload_object(key, entry.data.clone());
             }
         }
 
-        let size = entry.data.len() as u64;
-        file_info.file_attributes = entry.attributes;
-        file_info.file_size = size;
-        file_info.allocation_size = size;
+        entry.fill_file_info(file_info);
         Ok(buffer.len() as u32)
     }
 
