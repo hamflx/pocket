@@ -64,8 +64,6 @@ struct S3Config {
     #[serde(default)]
     region: Option<String>,
     #[serde(default)]
-    prefix: Option<String>,
-    #[serde(default)]
     endpoint: Option<String>,
     /// Base name (without extension) of encrypted credential file
     #[serde(default)]
@@ -89,13 +87,12 @@ struct MountConfig {
     mount_path: String,
     /// Name of storage backend to use
     storage: String,
+    #[serde(default)]
+    prefix: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
 struct AppConfig {
-    /// Global storage configuration (currently used by `ConfigS3` CLI)
-    #[serde(default)]
-    storage: StorageConfig,
     /// Named storage backends that can be referenced from mounts
     #[serde(default)]
     storages: HashMap<String, StorageConfig>,
@@ -442,8 +439,8 @@ struct S3State {
 }
 
 impl S3State {
-    fn new(cfg: &S3Config) -> Result<Self, Box<dyn std::error::Error>> {
-        let key_prefix = Self::normalize_prefix(cfg.prefix.clone());
+    fn new(cfg: &S3Config, prefix: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
+        let key_prefix = Self::normalize_prefix(prefix);
 
         let mut access_key_id: Option<String> = None;
         let mut secret_access_key: Option<String> = None;
@@ -652,7 +649,10 @@ struct RemoteFilesystem {
 }
 
 impl RemoteFilesystem {
-    fn new(storage: &StorageConfig) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(
+        storage: &StorageConfig,
+        prefix: Option<String>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let custom_sd = Self::build_user_only_security_descriptor()?;
         if let Ok(custom_sddl) = Self::sd_to_sddl(&custom_sd) {
             debug!("Custom SD SDDL : {}", custom_sddl);
@@ -689,12 +689,12 @@ impl RemoteFilesystem {
                 };
 
                 if let Some(s3_cfg) = s3_cfg {
-                    match S3State::new(&s3_cfg) {
+                    match S3State::new(&s3_cfg, prefix.clone()) {
                         Ok(state) => {
                             info!(
                                 "S3 backend enabled, bucket={}, prefix={}",
                                 s3_cfg.bucket,
-                                s3_cfg.prefix.unwrap_or_default()
+                                prefix.unwrap_or_default()
                             );
                             Some(state)
                         }
@@ -1544,20 +1544,20 @@ fn handle_config_s3(args: ConfigS3Args) -> Result<(), Box<dyn std::error::Error>
         AppConfig::default()
     };
 
-    // For now, keep legacy behavior: configure the global storage backend.
-    // Multi-mount support reads from `cfg.mounts`; callers that want per-mount
-    // S3 config should edit the config file accordingly or a future dedicated
-    // CLI command can be added.
-    cfg.storage.backend = BackendKind::S3;
-    cfg.storage.s3 = Some(S3Config {
-        bucket: args.bucket,
-        access_key_id: None,
-        secret_access_key: None,
-        region: args.region,
-        prefix: args.prefix,
-        endpoint: args.endpoint,
-        credentials: Some(args.credentials),
-    });
+    cfg.storages.insert(
+        "default".to_string(),
+        StorageConfig {
+            backend: BackendKind::S3,
+            s3: Some(S3Config {
+                bucket: args.bucket,
+                access_key_id: None,
+                secret_access_key: None,
+                region: args.region,
+                endpoint: args.endpoint,
+                credentials: Some(args.credentials),
+            }),
+        },
+    );
 
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -1732,7 +1732,7 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
             m.name, mount_path, storage.backend
         );
 
-        let fs = RemoteFilesystem::new(&storage)?;
+        let fs = RemoteFilesystem::new(&storage, m.prefix)?;
         let params = build_volume_params();
         let mut host = FileSystemHost::new(params, fs)?;
         host.mount(&mount_path)?;
