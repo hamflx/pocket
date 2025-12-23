@@ -1,0 +1,52 @@
+[package]
+name = "pocket"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sysinfo = "0.37.2"
+widestring = "1.2.1"
+windows = { version = "0.61.3", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_System_Threading",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+tracing-appender = "0.2"
+directories = "5"
+clap = { version = "4", features = ["derive"] }
+
+[dependencies.winfsp]
+version = "0.12"
+features = ["system"]
+
+[dependencies.winfsp-sys]
+version = "0.12"
+features = ["system"]
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+
+[dependencies.toml]
+version = "0.8"
+
+[dependencies.aws-config]
+version = "1"
+
+[dependencies.aws-sdk-s3]
+version = "1"
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread"]
+
+[build-dependencies]
+winfsp = "0.12"
+
+[features]
+default = []
