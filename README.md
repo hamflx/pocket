@@ -1,4 +1,4 @@
-# SSH FS Interceptor
+# Pocket
 
 This program uses `winfsp-rs` to mount a virtual file system at the current user's `.ssh` directory (for example `C:\Users\yourname\.ssh`).
 It intercepts access to `id_ed25519` and returns "hello world".

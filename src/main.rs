@@ -280,7 +280,7 @@ struct MemEntry {
 }
 
 #[derive(Debug)]
-struct SshFileContext {
+struct RemoteFilesystemFileContext {
     path: String,
     is_dir: bool,
     pid: Option<u32>,
@@ -495,14 +495,14 @@ impl S3State {
     }
 }
 
-struct SshFs {
+struct RemoteFilesystem {
     entries: RwLock<HashMap<String, MemEntry>>,
     security_descriptor: Vec<u8>,
     s3: Option<S3State>,
     process_name_cache: RwLock<HashMap<u32, String>>,
 }
 
-impl SshFs {
+impl RemoteFilesystem {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let cfg = load_config();
 
@@ -566,7 +566,7 @@ impl SshFs {
             Self::hydrate_from_s3(&mut map, s3_state);
         }
 
-        Ok(SshFs {
+        Ok(RemoteFilesystem {
             entries: RwLock::new(map),
             security_descriptor,
             s3,
@@ -763,8 +763,8 @@ impl SshFs {
     }
 }
 
-impl FileSystemContext for SshFs {
-    type FileContext = SshFileContext;
+impl FileSystemContext for RemoteFilesystem {
+    type FileContext = RemoteFilesystemFileContext;
 
     fn get_security_by_name(
         &self,
@@ -833,7 +833,7 @@ impl FileSystemContext for SshFs {
 
             debug!("open: file_info: {:?}", fi);
 
-            Ok(SshFileContext {
+            Ok(RemoteFilesystemFileContext {
                 path,
                 is_dir: entry.is_dir,
                 pid: match pid {
@@ -906,7 +906,7 @@ impl FileSystemContext for SshFs {
         fi.index_number = 0;
         fi.hard_links = 0;
 
-        Ok(SshFileContext {
+        Ok(RemoteFilesystemFileContext {
             path,
             is_dir: entry.is_dir,
             pid: match pid {
@@ -1038,7 +1038,7 @@ impl FileSystemContext for SshFs {
         let total_size = 1024 * 1024 * 1024u64; // 1 GiB
         out_volume_info.total_size = total_size;
         out_volume_info.free_size = total_size;
-        out_volume_info.set_volume_label("SshMemFS");
+        out_volume_info.set_volume_label("RemoteFilesystem");
         Ok(())
     }
 
@@ -1335,7 +1335,7 @@ impl FileSystemContext for SshFs {
     name = "pocket",
     author,
     version,
-    about = "SSH FS interceptor with S3 backend"
+    about = "Remote filesystem with S3 backend"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -1418,7 +1418,7 @@ fn handle_config_s3(args: ConfigS3Args) -> Result<(), Box<dyn std::error::Error>
 }
 
 fn run_main() -> Result<(), Box<dyn std::error::Error>> {
-    let fs = SshFs::new()?;
+    let fs = RemoteFilesystem::new()?;
     let mut params = VolumeParams::default();
     params
         .sector_size(512)
