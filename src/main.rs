@@ -1493,6 +1493,10 @@ struct Cli {
 enum Command {
     /// Configure S3 backend and encrypted credentials
     ConfigS3(ConfigS3Args),
+    /// Install pocket as a service with auto-start
+    Install,
+    /// Uninstall pocket service and remove auto-start
+    Uninstall,
 }
 
 #[derive(Args, Debug)]
@@ -1568,6 +1572,150 @@ fn handle_config_s3(args: ConfigS3Args) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+#[cfg(windows)]
+fn install_dir() -> PathBuf {
+    if let Some(dirs) = ProjectDirs::from("dev", "hamflx", "pocket") {
+        return dirs.data_local_dir().join("bin");
+    }
+    PathBuf::from("bin")
+}
+
+#[cfg(not(windows))]
+fn install_dir() -> PathBuf {
+    PathBuf::from("/usr/local/bin")
+}
+
+#[cfg(windows)]
+fn handle_install() -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs;
+    use windows_registry::CURRENT_USER;
+
+    // Get the current executable path
+    let current_exe = std::env::current_exe()?;
+    info!("Current executable: {}", current_exe.display());
+
+    // Determine installation directory
+    let install_directory = install_dir();
+    fs::create_dir_all(&install_directory)?;
+
+    let installed_exe = install_directory.join("pocket.exe");
+    info!("Installing to: {}", installed_exe.display());
+
+    // Copy the executable to the installation directory
+    if current_exe != installed_exe {
+        fs::copy(&current_exe, &installed_exe)?;
+        info!("Copied executable to {}", installed_exe.display());
+    } else {
+        info!("Already installed at target location");
+    }
+
+    // Add to registry for auto-start (HKCU\Software\Microsoft\Windows\CurrentVersion\Run)
+    let key = CURRENT_USER.create("Software\\Microsoft\\Windows\\CurrentVersion\\Run")?;
+    key.set_string("Pocket", &format!("\"{}\"", installed_exe.display()))?;
+    info!("Added to Windows startup registry");
+
+    // Start the service in background (no console window)
+    start_background_service(&installed_exe)?;
+    info!("Started pocket service in background");
+
+    println!("✓ Installation completed successfully!");
+    println!("  Installed to: {}", installed_exe.display());
+    println!("  Auto-start: Enabled");
+    println!("  Service: Running in background");
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn handle_install() -> Result<(), Box<dyn std::error::Error>> {
+    Err("Install command is only supported on Windows".into())
+}
+
+#[cfg(windows)]
+fn handle_uninstall() -> Result<(), Box<dyn std::error::Error>> {
+    use windows_registry::CURRENT_USER;
+
+    // Remove from registry
+    if let Ok(key) = CURRENT_USER.open("Software\\Microsoft\\Windows\\CurrentVersion\\Run") {
+        if let Err(e) = key.remove_value("Pocket") {
+            warn!("Failed to remove registry entry: {}", e);
+        } else {
+            info!("Removed from Windows startup registry");
+        }
+    }
+
+    // Stop any running instances
+    stop_background_service()?;
+
+    // Optionally remove the installed executable
+    let installed_exe = install_dir().join("pocket.exe");
+    if installed_exe.exists() {
+        // We can't delete ourselves if we're running from the install location
+        let current_exe = std::env::current_exe()?;
+        if current_exe != installed_exe {
+            if let Err(e) = std::fs::remove_file(&installed_exe) {
+                warn!("Failed to remove installed executable: {}", e);
+                println!("Note: Please manually delete: {}", installed_exe.display());
+            } else {
+                info!("Removed installed executable");
+            }
+        } else {
+            println!("Note: Please manually delete: {}", installed_exe.display());
+        }
+    }
+
+    println!("✓ Uninstallation completed!");
+    println!("  Auto-start: Disabled");
+    println!("  Service: Stopped");
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn handle_uninstall() -> Result<(), Box<dyn std::error::Error>> {
+    Err("Uninstall command is only supported on Windows".into())
+}
+
+#[cfg(windows)]
+fn start_background_service(exe_path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    Command::new(exe_path)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()?;
+
+    info!("Started background service from {}", exe_path.display());
+    Ok(())
+}
+
+#[cfg(windows)]
+fn stop_background_service() -> Result<(), Box<dyn std::error::Error>> {
+    use std::process::Command;
+
+    // Use taskkill to stop any running pocket.exe instances
+    let output = Command::new("taskkill")
+        .args(["/F", "/IM", "pocket.exe"])
+        .output();
+
+    match output {
+        Ok(out) => {
+            if out.status.success() {
+                info!("Stopped pocket service");
+            } else {
+                debug!("No pocket service was running or failed to stop");
+            }
+        }
+        Err(e) => {
+            warn!("Failed to execute taskkill: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
 fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     // Ensure WinFsp DLL is loaded when using delay-load linkage.
     load_winfsp_dll()?;
@@ -1592,16 +1740,36 @@ fn run_main() -> Result<(), Box<dyn std::error::Error>> {
         hosts.push(host);
     }
 
-    info!("All mounts started. Press ENTER to stop.");
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    info!("All mounts started.");
 
-    for mut host in hosts {
-        host.stop();
-        host.unmount();
+    // Check if running in service mode (no console attached)
+    if is_console_attached() {
+        println!("Press ENTER to stop.");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+
+        for mut host in hosts {
+            host.stop();
+            host.unmount();
+        }
+    } else {
+        info!("Running as background service. Use 'pocket uninstall' to stop.");
+        // Keep the service running indefinitely
+        std::thread::park();
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn is_console_attached() -> bool {
+    use windows::Win32::System::Console::GetConsoleWindow;
+    unsafe { !GetConsoleWindow().is_invalid() }
+}
+
+#[cfg(not(windows))]
+fn is_console_attached() -> bool {
+    true
 }
 
 fn main() {
@@ -1644,6 +1812,8 @@ fn main() {
     if let Some(command) = cli.command {
         if let Err(e) = match command {
             Command::ConfigS3(args) => handle_config_s3(args),
+            Command::Install => handle_install(),
+            Command::Uninstall => handle_uninstall(),
         } {
             error!("Error: {e}");
             let mut source = e.source();

@@ -58,12 +58,12 @@ Behavior when `backend = "s3"`:
 Instead of putting S3 credentials directly into `config.toml`, use the built‑in CLI to store them encrypted with the Windows Data Protection API and update the config file automatically:
 
 ```bash
-pocket config s3 \
+pocket config-s3 \
   --bucket your-bucket-name \
   --region cn-hangzhou \
   --prefix optional/prefix \
   --endpoint https://oss-cn-hangzhou.aliyuncs.com \
-  --credentials-name default \
+  --credentials default \
   --access-key-id YOUR_ACCESS_KEY_ID \
   --secret-access-key YOUR_SECRET_ACCESS_KEY
 ```
@@ -72,6 +72,28 @@ This command will:
 
 - Encrypt the access key ID and secret access key using the current Windows user and store them under a file whose base name is `credentials` (e.g. `default.bin`) in a platform‑specific configuration directory.
 - Write or update `config.toml` to use the S3 backend and reference the encrypted credential file via `[storage.s3].credentials`.
+
+## Installation as a Windows Service (Auto-start)
+
+To install Pocket as a service that automatically starts when Windows boots:
+
+```bash
+pocket install
+```
+
+This command will:
+
+- Copy the executable to `%LOCALAPPDATA%\hamflx\pocket\data\bin\pocket.exe`
+- Add a registry entry to start Pocket automatically on Windows startup
+- Start the service immediately in the background (without showing a console window)
+
+To uninstall the service:
+
+```bash
+pocket uninstall
+```
+
+This will remove the auto-start registry entry and stop any running instances.
 
 ## Note
 
