@@ -4,11 +4,15 @@ use tracing::{error, info};
 mod config;
 mod credentials;
 mod index_crdt;
+mod fs_types;
+mod storage;
+mod s3_backend;
 mod remote_fs;
 mod service;
 mod cli;
 
-pub use remote_fs::{MemEntry, RemoteFilesystem};
+pub use remote_fs::RemoteFilesystem;
+pub use fs_types::MemEntry;
 
 fn main() {
     // 初始化 tracing 日志，输出到日志文件
@@ -71,4 +75,3 @@ fn main() {
         std::process::exit(1);
     }
 }
-
