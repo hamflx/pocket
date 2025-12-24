@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
@@ -21,7 +22,7 @@ use windows::Win32::Security::{
     OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::core::{HSTRING, PWSTR};
@@ -36,7 +37,10 @@ use winfsp::host::{FileSystemHost, VolumeParams};
 use aws_config;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::primitives::ByteStream;
+use bincode;
+use hex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 use tracing::{debug, error, info, warn};
 use winfsp_sys::FspFileSystemOperationProcessIdF;
@@ -417,10 +421,45 @@ fn effective_mounts(
     Ok(result)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct ObjectId([u8; 32]);
+
+impl ObjectId {
+    fn from_data(data: &[u8]) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&hash);
+        ObjectId(bytes)
+    }
+
+    fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+
+    fn from_hex(s: &str) -> Option<Self> {
+        let bytes = hex::decode(s).ok()?;
+        if bytes.len() != 32 {
+            return None;
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Some(ObjectId(arr))
+    }
+}
+
+impl fmt::Display for ObjectId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.to_hex())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MemEntry {
     is_dir: bool,
-    data: Vec<u8>,
+    object_id: Option<ObjectId>,
+    size: u64,
     attributes: u32,
     creation_time: u64,
     last_access_time: u64,
@@ -436,7 +475,7 @@ impl MemEntry {
             file_info.file_size = 0;
             file_info.allocation_size = 0;
         } else {
-            let size = self.data.len() as u64;
+            let size = self.size;
             file_info.file_size = size;
             file_info.allocation_size = size;
         }
@@ -459,6 +498,73 @@ fn current_filetime() -> u64 {
     ticks + FILETIME_UNIX_DIFF
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IndexSnapshot {
+    entries: HashMap<String, MemEntry>,
+}
+
+trait ObjectStore: Send + Sync {
+    fn get(&self, id: &ObjectId) -> Option<Vec<u8>>;
+    fn put(&self, data: &[u8]) -> ObjectId;
+}
+
+trait IndexStore: Send + Sync {
+    fn load_latest(&self) -> Option<IndexSnapshot>;
+    fn save(&self, snapshot: &IndexSnapshot);
+}
+
+#[derive(Debug)]
+struct InMemoryObjectStore {
+    objects: RwLock<HashMap<ObjectId, Vec<u8>>>,
+}
+
+impl InMemoryObjectStore {
+    fn new() -> Self {
+        InMemoryObjectStore {
+            objects: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl ObjectStore for InMemoryObjectStore {
+    fn get(&self, id: &ObjectId) -> Option<Vec<u8>> {
+        let objects = self.objects.read().unwrap();
+        objects.get(id).cloned()
+    }
+
+    fn put(&self, data: &[u8]) -> ObjectId {
+        let id = ObjectId::from_data(data);
+        let mut objects = self.objects.write().unwrap();
+        objects.insert(id, data.to_vec());
+        id
+    }
+}
+
+#[derive(Debug)]
+struct InMemoryIndexStore {
+    snapshot: RwLock<Option<IndexSnapshot>>,
+}
+
+impl InMemoryIndexStore {
+    fn new() -> Self {
+        InMemoryIndexStore {
+            snapshot: RwLock::new(None),
+        }
+    }
+}
+
+impl IndexStore for InMemoryIndexStore {
+    fn load_latest(&self) -> Option<IndexSnapshot> {
+        let snap = self.snapshot.read().unwrap();
+        snap.clone()
+    }
+
+    fn save(&self, snapshot: &IndexSnapshot) {
+        let mut snap = self.snapshot.write().unwrap();
+        *snap = Some(snapshot.clone());
+    }
+}
+
 #[derive(Debug)]
 struct RemoteFilesystemFileContext {
     path: String,
@@ -466,6 +572,7 @@ struct RemoteFilesystemFileContext {
     pid: Option<u32>,
 }
 
+#[derive(Debug)]
 struct S3State {
     client: S3Client,
     bucket: String,
@@ -537,6 +644,40 @@ impl S3State {
             bucket: cfg.bucket.clone(),
             key_prefix,
             runtime: Arc::new(runtime),
+        })
+    }
+
+    fn key_for_data(&self, id: &ObjectId) -> String {
+        format!("{}data/{}", self.key_prefix, id.to_hex())
+    }
+
+    fn key_for_index_head(&self) -> String {
+        format!("{}index/head", self.key_prefix)
+    }
+
+    fn key_for_index_object(&self, id: &ObjectId) -> String {
+        format!("{}index/objects/{}", self.key_prefix, id.to_hex())
+    }
+
+    fn get_object_bytes(&self, key: String) -> Option<Vec<u8>> {
+        let client = self.client.clone();
+        let bucket = self.bucket.clone();
+        let rt = self.runtime.clone();
+
+        rt.block_on(async move {
+            match client.get_object().bucket(&bucket).key(&key).send().await {
+                Ok(output) => match output.body.collect().await {
+                    Ok(aggregated) => Some(aggregated.into_bytes().to_vec()),
+                    Err(err) => {
+                        error!("S3 get_object body error for {}: {err}", key);
+                        None
+                    }
+                },
+                Err(err) => {
+                    error!("S3 get_object error for {}: {err}", key);
+                    None
+                }
+            }
         })
     }
 
@@ -676,10 +817,83 @@ impl S3State {
     }
 }
 
+#[derive(Debug)]
+struct S3ObjectStore {
+    state: Arc<S3State>,
+}
+
+impl S3ObjectStore {
+    fn new(state: Arc<S3State>) -> Self {
+        S3ObjectStore { state }
+    }
+}
+
+impl ObjectStore for S3ObjectStore {
+    fn get(&self, id: &ObjectId) -> Option<Vec<u8>> {
+        let key = self.state.key_for_data(id);
+        self.state.get_object_bytes(key)
+    }
+
+    fn put(&self, data: &[u8]) -> ObjectId {
+        let id = ObjectId::from_data(data);
+        let key = self.state.key_for_data(&id);
+        self.state.upload_object(key, data.to_vec());
+        id
+    }
+}
+
+#[derive(Debug)]
+struct S3IndexStore {
+    state: Arc<S3State>,
+}
+
+impl S3IndexStore {
+    fn new(state: Arc<S3State>) -> Self {
+        S3IndexStore { state }
+    }
+}
+
+impl IndexStore for S3IndexStore {
+    fn load_latest(&self) -> Option<IndexSnapshot> {
+        let head_key = self.state.key_for_index_head();
+        let head_bytes = self.state.get_object_bytes(head_key)?;
+        let head_str = String::from_utf8(head_bytes).ok()?;
+        let head_str = head_str.trim();
+        let id = ObjectId::from_hex(head_str)?;
+        let index_key = self.state.key_for_index_object(&id);
+        let data = self.state.get_object_bytes(index_key)?;
+        match bincode::deserialize::<IndexSnapshot>(&data) {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                error!("Failed to deserialize index snapshot from S3: {err}");
+                None
+            }
+        }
+    }
+
+    fn save(&self, snapshot: &IndexSnapshot) {
+        let bytes = match bincode::serialize(snapshot) {
+            Ok(b) => b,
+            Err(err) => {
+                error!("Failed to serialize index snapshot: {err}");
+                return;
+            }
+        };
+        let id = ObjectId::from_data(&bytes);
+        let index_key = self.state.key_for_index_object(&id);
+        self.state.upload_object(index_key, bytes);
+
+        let head_key = self.state.key_for_index_head();
+        let head_contents = id.to_hex().into_bytes();
+        self.state.upload_object(head_key, head_contents);
+    }
+}
+
 struct RemoteFilesystem {
     entries: RwLock<HashMap<String, MemEntry>>,
     security_descriptor: Vec<u8>,
-    s3: Option<S3State>,
+    object_store: Arc<dyn ObjectStore>,
+    index_store: Option<Arc<dyn IndexStore>>,
     process_name_cache: RwLock<HashMap<u32, String>>,
 }
 
@@ -696,67 +910,71 @@ impl RemoteFilesystem {
         }
 
         let security_descriptor = custom_sd;
-        let mut map = HashMap::new();
-
-        let now = current_filetime();
-        map.insert(
-            "\\".to_string(),
-            MemEntry {
-                is_dir: true,
-                data: Vec::new(),
-                attributes: FILE_ATTRIBUTE_DIRECTORY.0,
-                creation_time: now,
-                last_access_time: now,
-                last_write_time: now,
-                change_time: now,
-            },
-        );
-
-        let s3 = match storage.backend {
-            BackendKind::Memory => {
-                info!("Using in-memory backend");
-                None
-            }
-            BackendKind::S3 => {
-                let s3_cfg = match storage.s3 {
-                    Some(ref s3_cfg) if !s3_cfg.bucket.is_empty() => Some(s3_cfg.clone()),
-                    _ => {
-                        warn!(
-                            "S3 backend selected but [storage.s3] configuration is missing or invalid; falling back to in-memory backend"
-                        );
-                        None
-                    }
-                };
-
-                if let Some(s3_cfg) = s3_cfg {
-                    match S3State::new(&s3_cfg, prefix.clone()) {
-                        Ok(state) => {
-                            info!(
-                                "S3 backend enabled, bucket={}, prefix={}",
-                                s3_cfg.bucket,
-                                prefix.unwrap_or_default()
-                            );
-                            Some(state)
-                        }
-                        Err(err) => {
-                            error!("Failed to initialize S3 backend: {err}");
-                            None
-                        }
-                    }
-                } else {
-                    None
+        let (object_store, index_store): (Arc<dyn ObjectStore>, Option<Arc<dyn IndexStore>>) =
+            match storage.backend {
+                BackendKind::Memory => {
+                    info!("Using in-memory backend");
+                    let obj = Arc::new(InMemoryObjectStore::new());
+                    let idx = Arc::new(InMemoryIndexStore::new());
+                    (obj, Some(idx))
                 }
+                BackendKind::S3 => {
+                    let s3_cfg = match storage.s3 {
+                        Some(ref s3_cfg) if !s3_cfg.bucket.is_empty() => s3_cfg,
+                        _ => {
+                            warn!(
+                                "S3 backend selected but [storage.s3] configuration is missing or invalid; falling back to in-memory backend"
+                            );
+                            let obj = Arc::new(InMemoryObjectStore::new());
+                            let idx = Arc::new(InMemoryIndexStore::new());
+                            return Ok(RemoteFilesystem {
+                                entries: RwLock::new(HashMap::new()),
+                                security_descriptor,
+                                object_store: obj,
+                                index_store: Some(idx),
+                                process_name_cache: RwLock::new(HashMap::new()),
+                            });
+                        }
+                    };
+
+                    let s3_state = Arc::new(S3State::new(s3_cfg, prefix.clone())?);
+                    info!(
+                        "S3 backend enabled, bucket={}, prefix={}",
+                        s3_cfg.bucket,
+                        prefix.unwrap_or_default()
+                    );
+                    let obj = Arc::new(S3ObjectStore::new(s3_state.clone()));
+                    let idx = Arc::new(S3IndexStore::new(s3_state));
+                    (obj, Some(idx))
+                }
+            };
+
+        let mut map = if let Some(ref store) = index_store {
+            match store.load_latest() {
+                Some(snapshot) => snapshot.entries,
+                None => HashMap::new(),
             }
+        } else {
+            HashMap::new()
         };
 
-        if let Some(ref s3_state) = s3 {
-            Self::hydrate_from_s3(&mut map, s3_state);
-        }
+        let now = current_filetime();
+        map.entry("\\".to_string()).or_insert(MemEntry {
+            is_dir: true,
+            object_id: None,
+            size: 0,
+            attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+            creation_time: now,
+            last_access_time: now,
+            last_write_time: now,
+            change_time: now,
+        });
 
         Ok(RemoteFilesystem {
             entries: RwLock::new(map),
             security_descriptor,
-            s3,
+            object_store,
+            index_store,
             process_name_cache: RwLock::new(HashMap::new()),
         })
     }
@@ -786,32 +1004,6 @@ impl RemoteFilesystem {
         }
     }
 
-    fn hydrate_from_s3(entries: &mut HashMap<String, MemEntry>, s3: &S3State) {
-        let objects = s3.load_all_objects();
-        if objects.is_empty() {
-            return;
-        }
-
-        let now = current_filetime();
-        for (key, data) in objects {
-            if let Some(path) = s3.key_to_path(&key) {
-                Self::ensure_parent_directories(entries, &path);
-                entries.insert(
-                    path.clone(),
-                    MemEntry {
-                        is_dir: false,
-                        data,
-                        attributes: FILE_ATTRIBUTE_ARCHIVE.0 | FILE_ATTRIBUTE_NORMAL.0,
-                        creation_time: now,
-                        last_access_time: now,
-                        last_write_time: now,
-                        change_time: now,
-                    },
-                );
-            }
-        }
-    }
-
     fn ensure_parent_directories(entries: &mut HashMap<String, MemEntry>, path: &str) {
         let trimmed = path.trim_start_matches('\\');
         if trimmed.is_empty() {
@@ -837,7 +1029,8 @@ impl RemoteFilesystem {
             let now = current_filetime();
             entries.entry(current.clone()).or_insert(MemEntry {
                 is_dir: true,
-                data: Vec::new(),
+                object_id: None,
+                size: 0,
                 attributes: FILE_ATTRIBUTE_DIRECTORY.0,
                 creation_time: now,
                 last_access_time: now,
@@ -957,6 +1150,25 @@ impl RemoteFilesystem {
         }
 
         process_name
+    }
+
+    fn load_file_data(&self, entry: &MemEntry) -> Vec<u8> {
+        if let Some(id) = entry.object_id {
+            if let Some(data) = self.object_store.get(&id) {
+                return data;
+            }
+        }
+        Vec::new()
+    }
+
+    fn persist_index(&self) {
+        if let Some(store) = &self.index_store {
+            let entries = self.entries.read().unwrap();
+            let snapshot = IndexSnapshot {
+                entries: entries.clone(),
+            };
+            store.save(&snapshot);
+        }
     }
 }
 
@@ -1095,7 +1307,8 @@ impl FileSystemContext for RemoteFilesystem {
         let now = current_filetime();
         let entry = entries.entry(path.clone()).or_insert(MemEntry {
             is_dir,
-            data: Vec::new(),
+            object_id: None,
+            size: 0,
             attributes: file_attributes,
             creation_time: now,
             last_access_time: now,
@@ -1106,7 +1319,8 @@ impl FileSystemContext for RemoteFilesystem {
         entry.is_dir = is_dir;
         entry.attributes = file_attributes;
         if !is_dir {
-            entry.data.clear();
+            entry.object_id = None;
+            entry.size = 0;
         }
         // Update timestamps on create/overwrite
         entry.last_access_time = now;
@@ -1118,9 +1332,14 @@ impl FileSystemContext for RemoteFilesystem {
         fi.index_number = 0;
         fi.hard_links = 0;
 
+        let resulting_is_dir = entry.is_dir;
+
+        drop(entries);
+        self.persist_index();
+
         Ok(RemoteFilesystemFileContext {
             path,
-            is_dir: entry.is_dir,
+            is_dir: resulting_is_dir,
             pid: match pid {
                 0 => None,
                 pid => Some(pid),
@@ -1135,8 +1354,6 @@ impl FileSystemContext for RemoteFilesystem {
                 .unwrap_or_else(|| context.path.clone());
             info!("cleanup delete: {}", path);
 
-            let mut deleted_paths: Vec<String> = Vec::new();
-
             let mut entries = self.entries.write().unwrap();
             // Remove the entry and all children if it is a directory.
             let keys: Vec<String> = entries
@@ -1147,20 +1364,12 @@ impl FileSystemContext for RemoteFilesystem {
             for k in keys {
                 // avoid deleting root
                 if k != "\\" {
-                    deleted_paths.push(k.clone());
                     entries.remove(&k);
                 }
             }
 
-            {
-                if let Some(s3) = &self.s3 {
-                    for path in deleted_paths {
-                        if let Some(key) = s3.path_to_key(&path) {
-                            s3.delete_object(key);
-                        }
-                    }
-                }
-            }
+            drop(entries);
+            self.persist_index();
         }
     }
 
@@ -1280,6 +1489,8 @@ impl FileSystemContext for RemoteFilesystem {
         }
 
         entry.fill_file_info(file_info);
+        drop(entries);
+        self.persist_index();
         Ok(())
     }
 
@@ -1307,19 +1518,42 @@ impl FileSystemContext for RemoteFilesystem {
         }
 
         let mut entries = self.entries.write().unwrap();
+        let data = {
+            let entry = entries
+                .get(&context.path)
+                .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+            self.load_file_data(entry)
+        };
         let entry = entries
             .get_mut(&context.path)
             .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
 
         let new_len = new_size as usize;
-        entry.data.resize(new_len, 0);
+        let mut new_data = data;
+        if new_len < new_data.len() {
+            new_data.truncate(new_len);
+        } else if new_len > new_data.len() {
+            new_data.resize(new_len, 0);
+        }
 
         // Update timestamps on size change
         let now = current_filetime();
         entry.last_write_time = now;
         entry.change_time = now;
+        entry.size = new_size;
+
+        if !entry.is_dir {
+            if new_len == 0 {
+                entry.object_id = None;
+            } else {
+                let id = self.object_store.put(&new_data);
+                entry.object_id = Some(id);
+            }
+        }
 
         entry.fill_file_info(file_info);
+        drop(entries);
+        self.persist_index();
         Ok(())
     }
 
@@ -1348,7 +1582,7 @@ impl FileSystemContext for RemoteFilesystem {
             .get(&context.path)
             .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
 
-        let data = &entry.data;
+        let data = self.load_file_data(entry);
         let offset = offset as usize;
         if offset >= data.len() {
             debug!("read: offset out of range");
@@ -1382,54 +1616,75 @@ impl FileSystemContext for RemoteFilesystem {
         }
 
         let mut entries = self.entries.write().unwrap();
+        let data = {
+            let entry = entries
+                .get(&context.path)
+                .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+            self.load_file_data(entry)
+        };
         let entry = entries
             .get_mut(&context.path)
             .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
 
+        let mut data = data;
+
         let write_offset = if write_to_eof {
-            entry.data.len()
+            data.len()
         } else {
             offset as usize
         };
 
         if constrained_io {
-            if write_offset >= entry.data.len() {
+            if write_offset >= data.len() {
                 return Ok(0);
             }
-            let max_len = entry.data.len() - write_offset;
+            let max_len = data.len() - write_offset;
             let write_len = buffer.len().min(max_len);
-            entry.data[write_offset..write_offset + write_len]
-                .copy_from_slice(&buffer[..write_len]);
+            data[write_offset..write_offset + write_len].copy_from_slice(&buffer[..write_len]);
 
             // Update timestamps on write
             let now = current_filetime();
             entry.last_access_time = now;
             entry.last_write_time = now;
             entry.change_time = now;
+            entry.size = data.len() as u64;
+
+            if !data.is_empty() {
+                let id = self.object_store.put(&data);
+                entry.object_id = Some(id);
+            } else {
+                entry.object_id = None;
+            }
 
             entry.fill_file_info(file_info);
+            drop(entries);
+            self.persist_index();
             return Ok(write_len as u32);
         }
 
         let end = write_offset.saturating_add(buffer.len());
-        if end > entry.data.len() {
-            entry.data.resize(end, 0);
+        if end > data.len() {
+            data.resize(end, 0);
         }
-        entry.data[write_offset..write_offset + buffer.len()].copy_from_slice(buffer);
+        data[write_offset..write_offset + buffer.len()].copy_from_slice(buffer);
 
         // Update timestamps on write
         let now = current_filetime();
         entry.last_access_time = now;
         entry.last_write_time = now;
         entry.change_time = now;
+        entry.size = data.len() as u64;
 
-        if let Some(s3) = &self.s3 {
-            if let Some(key) = s3.path_to_key(&context.path) {
-                s3.upload_object(key, entry.data.clone());
-            }
+        if !data.is_empty() {
+            let id = self.object_store.put(&data);
+            entry.object_id = Some(id);
+        } else {
+            entry.object_id = None;
         }
 
         entry.fill_file_info(file_info);
+        drop(entries);
+        self.persist_index();
         Ok(buffer.len() as u32)
     }
 
@@ -1470,7 +1725,7 @@ impl FileSystemContext for RemoteFilesystem {
                         let size = if entry.is_dir {
                             0
                         } else {
-                            entry.data.len() as u64
+                            entry.size
                         };
                         all_entries.push((name.to_string(), entry.is_dir, size, entry.attributes));
                     }
@@ -1572,19 +1827,7 @@ impl FileSystemContext for RemoteFilesystem {
         }
 
         drop(entries);
-
-        if let Some(s3) = &self.s3 {
-            for (old_p, new_p, entry) in moved.iter() {
-                if !entry.is_dir {
-                    if let Some(new_key) = s3.path_to_key(new_p) {
-                        s3.upload_object(new_key, entry.data.clone());
-                    }
-                    if let Some(old_key) = s3.path_to_key(old_p) {
-                        s3.delete_object(old_key);
-                    }
-                }
-            }
-        }
+        self.persist_index();
 
         Ok(())
     }
