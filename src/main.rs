@@ -37,13 +37,15 @@ use winfsp::host::{FileSystemHost, VolumeParams};
 use aws_config;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::primitives::ByteStream;
-use bincode;
 use hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 use tracing::{debug, error, info, warn};
 use winfsp_sys::FspFileSystemOperationProcessIdF;
+
+mod index_crdt;
+use index_crdt::LoroIndex;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -498,19 +500,14 @@ fn current_filetime() -> u64 {
     ticks + FILETIME_UNIX_DIFF
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct IndexSnapshot {
-    entries: HashMap<String, MemEntry>,
-}
-
 trait ObjectStore: Send + Sync {
     fn get(&self, id: &ObjectId) -> Option<Vec<u8>>;
     fn put(&self, data: &[u8]) -> ObjectId;
 }
 
 trait IndexStore: Send + Sync {
-    fn load_latest(&self) -> Option<IndexSnapshot>;
-    fn save(&self, snapshot: &IndexSnapshot);
+    fn load_latest(&self) -> Option<Vec<u8>>;
+    fn save(&self, data: &[u8]);
 }
 
 #[derive(Debug)]
@@ -542,26 +539,26 @@ impl ObjectStore for InMemoryObjectStore {
 
 #[derive(Debug)]
 struct InMemoryIndexStore {
-    snapshot: RwLock<Option<IndexSnapshot>>,
+    data: RwLock<Option<Vec<u8>>>,
 }
 
 impl InMemoryIndexStore {
     fn new() -> Self {
         InMemoryIndexStore {
-            snapshot: RwLock::new(None),
+            data: RwLock::new(None),
         }
     }
 }
 
 impl IndexStore for InMemoryIndexStore {
-    fn load_latest(&self) -> Option<IndexSnapshot> {
-        let snap = self.snapshot.read().unwrap();
-        snap.clone()
+    fn load_latest(&self) -> Option<Vec<u8>> {
+        let data = self.data.read().unwrap();
+        data.clone()
     }
 
-    fn save(&self, snapshot: &IndexSnapshot) {
-        let mut snap = self.snapshot.write().unwrap();
-        *snap = Some(snapshot.clone());
+    fn save(&self, data: &[u8]) {
+        let mut slot = self.data.write().unwrap();
+        *slot = Some(data.to_vec());
     }
 }
 
@@ -854,34 +851,20 @@ impl S3IndexStore {
 }
 
 impl IndexStore for S3IndexStore {
-    fn load_latest(&self) -> Option<IndexSnapshot> {
+    fn load_latest(&self) -> Option<Vec<u8>> {
         let head_key = self.state.key_for_index_head();
         let head_bytes = self.state.get_object_bytes(head_key)?;
         let head_str = String::from_utf8(head_bytes).ok()?;
         let head_str = head_str.trim();
         let id = ObjectId::from_hex(head_str)?;
         let index_key = self.state.key_for_index_object(&id);
-        let data = self.state.get_object_bytes(index_key)?;
-        match bincode::deserialize::<IndexSnapshot>(&data) {
-            Ok(snapshot) => Some(snapshot),
-            Err(err) => {
-                error!("Failed to deserialize index snapshot from S3: {err}");
-                None
-            }
-        }
+        self.state.get_object_bytes(index_key)
     }
 
-    fn save(&self, snapshot: &IndexSnapshot) {
-        let bytes = match bincode::serialize(snapshot) {
-            Ok(b) => b,
-            Err(err) => {
-                error!("Failed to serialize index snapshot: {err}");
-                return;
-            }
-        };
-        let id = ObjectId::from_data(&bytes);
+    fn save(&self, data: &[u8]) {
+        let id = ObjectId::from_data(data);
         let index_key = self.state.key_for_index_object(&id);
-        self.state.upload_object(index_key, bytes);
+        self.state.upload_object(index_key, data.to_vec());
 
         let head_key = self.state.key_for_index_head();
         let head_contents = id.to_hex().into_bytes();
@@ -890,7 +873,7 @@ impl IndexStore for S3IndexStore {
 }
 
 struct RemoteFilesystem {
-    entries: RwLock<HashMap<String, MemEntry>>,
+    index: RwLock<LoroIndex>,
     security_descriptor: Vec<u8>,
     object_store: Arc<dyn ObjectStore>,
     index_store: Option<Arc<dyn IndexStore>>,
@@ -927,8 +910,10 @@ impl RemoteFilesystem {
                             );
                             let obj = Arc::new(InMemoryObjectStore::new());
                             let idx = Arc::new(InMemoryIndexStore::new());
+                            let now = current_filetime();
+                            let index = LoroIndex::new_empty(now, FILE_ATTRIBUTE_DIRECTORY.0);
                             return Ok(RemoteFilesystem {
-                                entries: RwLock::new(HashMap::new()),
+                                index: RwLock::new(index),
                                 security_descriptor,
                                 object_store: obj,
                                 index_store: Some(idx),
@@ -949,29 +934,25 @@ impl RemoteFilesystem {
                 }
             };
 
-        let mut map = if let Some(ref store) = index_store {
+        let now = current_filetime();
+
+        let index = if let Some(ref store) = index_store {
             match store.load_latest() {
-                Some(snapshot) => snapshot.entries,
-                None => HashMap::new(),
+                Some(bytes) => match LoroIndex::from_bytes(&bytes) {
+                    Ok(idx) => idx,
+                    Err(err) => {
+                        error!("Failed to load index from store, creating new: {err}");
+                        LoroIndex::new_empty(now, FILE_ATTRIBUTE_DIRECTORY.0)
+                    }
+                },
+                None => LoroIndex::new_empty(now, FILE_ATTRIBUTE_DIRECTORY.0),
             }
         } else {
-            HashMap::new()
+            LoroIndex::new_empty(now, FILE_ATTRIBUTE_DIRECTORY.0)
         };
 
-        let now = current_filetime();
-        map.entry("\\".to_string()).or_insert(MemEntry {
-            is_dir: true,
-            object_id: None,
-            size: 0,
-            attributes: FILE_ATTRIBUTE_DIRECTORY.0,
-            creation_time: now,
-            last_access_time: now,
-            last_write_time: now,
-            change_time: now,
-        });
-
         Ok(RemoteFilesystem {
-            entries: RwLock::new(map),
+            index: RwLock::new(index),
             security_descriptor,
             object_store,
             index_store,
@@ -1163,11 +1144,9 @@ impl RemoteFilesystem {
 
     fn persist_index(&self) {
         if let Some(store) = &self.index_store {
-            let entries = self.entries.read().unwrap();
-            let snapshot = IndexSnapshot {
-                entries: entries.clone(),
-            };
-            store.save(&snapshot);
+            let index = self.index.read().unwrap();
+            let bytes = index.to_bytes();
+            store.save(&bytes);
         }
     }
 }
@@ -1184,7 +1163,8 @@ impl FileSystemContext for RemoteFilesystem {
         let path = Self::normalize_path(file_name);
         debug!("get_security_by_name: {}", path);
 
-        let entries = self.entries.read().unwrap();
+        let index = self.index.read().unwrap();
+        let entries = index.entries();
         let attributes = if let Some(entry) = entries.get(&path) {
             entry.attributes
         } else if path == "\\" {
@@ -1225,8 +1205,8 @@ impl FileSystemContext for RemoteFilesystem {
 
         let pid = unsafe { FspFileSystemOperationProcessIdF() };
 
-        let entries = self.entries.read().unwrap();
-        if let Some(entry) = entries.get(&path) {
+        let index = self.index.read().unwrap();
+        if let Some(entry) = index.get(&path) {
             let fi = file_info.as_mut();
             entry.fill_file_info(fi);
             fi.index_number = 0;
@@ -1257,8 +1237,8 @@ impl FileSystemContext for RemoteFilesystem {
     ) -> Result<(), FspError> {
         if let Some(ctx) = context {
             debug!("flush: {}", ctx.path);
-            let entries = self.entries.read().unwrap();
-            if let Some(entry) = entries.get(&ctx.path) {
+            let index = self.index.read().unwrap();
+            if let Some(entry) = index.get(&ctx.path) {
                 entry.fill_file_info(file_info);
             }
         } else {
@@ -1298,7 +1278,8 @@ impl FileSystemContext for RemoteFilesystem {
         }
 
         let parent = Self::parent_path(&path).unwrap_or_else(|| "\\".to_string());
-        let mut entries = self.entries.write().unwrap();
+        let mut index = self.index.write().unwrap();
+        let entries = index.entries_mut();
 
         if !entries.contains_key(&parent) {
             return Err(FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
@@ -1334,7 +1315,7 @@ impl FileSystemContext for RemoteFilesystem {
 
         let resulting_is_dir = entry.is_dir;
 
-        drop(entries);
+        drop(index);
         self.persist_index();
 
         Ok(RemoteFilesystemFileContext {
@@ -1354,21 +1335,9 @@ impl FileSystemContext for RemoteFilesystem {
                 .unwrap_or_else(|| context.path.clone());
             info!("cleanup delete: {}", path);
 
-            let mut entries = self.entries.write().unwrap();
-            // Remove the entry and all children if it is a directory.
-            let keys: Vec<String> = entries
-                .keys()
-                .filter(|k| k.as_str() == path || k.starts_with(&(path.clone() + "\\")))
-                .cloned()
-                .collect();
-            for k in keys {
-                // avoid deleting root
-                if k != "\\" {
-                    entries.remove(&k);
-                }
-            }
-
-            drop(entries);
+            let mut index = self.index.write().unwrap();
+            index.delete_path_recursive(&path);
+            drop(index);
             self.persist_index();
         }
     }
@@ -1383,8 +1352,8 @@ impl FileSystemContext for RemoteFilesystem {
         out_file_info.index_number = 0;
         out_file_info.hard_links = 0;
 
-        let entries = self.entries.read().unwrap();
-        if let Some(entry) = entries.get(&context.path) {
+        let index = self.index.read().unwrap();
+        if let Some(entry) = index.get(&context.path) {
             entry.fill_file_info(out_file_info);
             debug!("get_file_info: file_info: {:?}", out_file_info);
         } else {
@@ -1465,31 +1434,36 @@ impl FileSystemContext for RemoteFilesystem {
             change_time
         );
 
-        let mut entries = self.entries.write().unwrap();
-        let entry = entries
-            .get_mut(&context.path)
-            .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+        let mut index = self.index.write().unwrap();
+        let updated = {
+            let entry = index
+                .get_mut(&context.path)
+                .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
 
-        // INVALID_FILE_ATTRIBUTES (0xFFFFFFFF) means "don't change"
-        if file_attributes != u32::MAX {
-            entry.attributes = file_attributes;
-        }
-        // 0 means "don't change" for timestamps
-        if creation_time != 0 {
-            entry.creation_time = creation_time;
-        }
-        if last_access_time != 0 {
-            entry.last_access_time = last_access_time;
-        }
-        if last_write_time != 0 {
-            entry.last_write_time = last_write_time;
-        }
-        if change_time != 0 {
-            entry.change_time = change_time;
-        }
+            // INVALID_FILE_ATTRIBUTES (0xFFFFFFFF) means "don't change"
+            if file_attributes != u32::MAX {
+                entry.attributes = file_attributes;
+            }
+            // 0 means "don't change" for timestamps
+            if creation_time != 0 {
+                entry.creation_time = creation_time;
+            }
+            if last_access_time != 0 {
+                entry.last_access_time = last_access_time;
+            }
+            if last_write_time != 0 {
+                entry.last_write_time = last_write_time;
+            }
+            if change_time != 0 {
+                entry.change_time = change_time;
+            }
 
-        entry.fill_file_info(file_info);
-        drop(entries);
+            entry.fill_file_info(file_info);
+            entry.clone()
+        };
+
+        index.upsert_entry(&context.path, updated);
+        drop(index);
         self.persist_index();
         Ok(())
     }
@@ -1517,42 +1491,47 @@ impl FileSystemContext for RemoteFilesystem {
             return Err(FspError::from(STATUS_INVALID_DEVICE_REQUEST));
         }
 
-        let mut entries = self.entries.write().unwrap();
-        let data = {
-            let entry = entries
-                .get(&context.path)
+        let mut index = self.index.write().unwrap();
+        let updated = {
+            let data = {
+                let entry = index
+                    .get(&context.path)
+                    .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+                self.load_file_data(entry)
+            };
+            let entry = index
+                .get_mut(&context.path)
                 .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
-            self.load_file_data(entry)
-        };
-        let entry = entries
-            .get_mut(&context.path)
-            .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
 
-        let new_len = new_size as usize;
-        let mut new_data = data;
-        if new_len < new_data.len() {
-            new_data.truncate(new_len);
-        } else if new_len > new_data.len() {
-            new_data.resize(new_len, 0);
-        }
-
-        // Update timestamps on size change
-        let now = current_filetime();
-        entry.last_write_time = now;
-        entry.change_time = now;
-        entry.size = new_size;
-
-        if !entry.is_dir {
-            if new_len == 0 {
-                entry.object_id = None;
-            } else {
-                let id = self.object_store.put(&new_data);
-                entry.object_id = Some(id);
+            let new_len = new_size as usize;
+            let mut new_data = data;
+            if new_len < new_data.len() {
+                new_data.truncate(new_len);
+            } else if new_len > new_data.len() {
+                new_data.resize(new_len, 0);
             }
-        }
 
-        entry.fill_file_info(file_info);
-        drop(entries);
+            // Update timestamps on size change
+            let now = current_filetime();
+            entry.last_write_time = now;
+            entry.change_time = now;
+            entry.size = new_size;
+
+            if !entry.is_dir {
+                if new_len == 0 {
+                    entry.object_id = None;
+                } else {
+                    let id = self.object_store.put(&new_data);
+                    entry.object_id = Some(id);
+                }
+            }
+
+            entry.fill_file_info(file_info);
+            entry.clone()
+        };
+
+        index.upsert_entry(&context.path, updated);
+        drop(index);
         self.persist_index();
         Ok(())
     }
@@ -1577,8 +1556,8 @@ impl FileSystemContext for RemoteFilesystem {
             return Err(FspError::from(STATUS_INVALID_DEVICE_REQUEST));
         }
 
-        let entries = self.entries.read().unwrap();
-        let entry = entries
+        let index = self.index.read().unwrap();
+        let entry = index
             .get(&context.path)
             .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
 
@@ -1615,18 +1594,16 @@ impl FileSystemContext for RemoteFilesystem {
             return Err(FspError::from(STATUS_INVALID_DEVICE_REQUEST));
         }
 
-        let mut entries = self.entries.write().unwrap();
-        let data = {
-            let entry = entries
+        let mut index = self.index.write().unwrap();
+        let mut data = {
+            let entry = index
                 .get(&context.path)
                 .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
             self.load_file_data(entry)
         };
-        let entry = entries
+        let entry = index
             .get_mut(&context.path)
             .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
-
-        let mut data = data;
 
         let write_offset = if write_to_eof {
             data.len()
@@ -1657,7 +1634,9 @@ impl FileSystemContext for RemoteFilesystem {
             }
 
             entry.fill_file_info(file_info);
-            drop(entries);
+            let updated = entry.clone();
+            index.upsert_entry(&context.path, updated);
+            drop(index);
             self.persist_index();
             return Ok(write_len as u32);
         }
@@ -1683,7 +1662,9 @@ impl FileSystemContext for RemoteFilesystem {
         }
 
         entry.fill_file_info(file_info);
-        drop(entries);
+        let updated = entry.clone();
+        index.upsert_entry(&context.path, updated);
+        drop(index);
         self.persist_index();
         Ok(buffer.len() as u32)
     }
@@ -1713,9 +1694,8 @@ impl FileSystemContext for RemoteFilesystem {
         all_entries.push(("..".to_string(), true, 0, FILE_ATTRIBUTE_DIRECTORY.0));
 
         let dir_path = &context.path;
-        let entries = self.entries.read().unwrap();
-
-        for (path, entry) in entries.iter() {
+        let index = self.index.read().unwrap();
+        for (path, entry) in index.entries().iter() {
             if path == dir_path {
                 continue;
             }
@@ -1791,42 +1771,19 @@ impl FileSystemContext for RemoteFilesystem {
             old_path, new_path, replace_if_exists
         );
 
-        let mut entries = self.entries.write().unwrap();
+        let mut index = self.index.write().unwrap();
+        let entries_exist = index.entries().contains_key(&old_path);
 
-        if !entries.contains_key(&old_path) {
+        if !entries_exist {
             return Err(FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
 
-        if entries.contains_key(&new_path) && !replace_if_exists {
+        if index.entries().contains_key(&new_path) && !replace_if_exists {
             return Err(FspError::from(STATUS_INVALID_DEVICE_REQUEST));
         }
 
-        // Collect entries to move (the path itself and any children if a directory).
-        let to_move_keys: Vec<String> = entries
-            .keys()
-            .filter(|k| k.as_str() == old_path || k.starts_with(&(old_path.clone() + "\\")))
-            .cloned()
-            .collect();
-
-        let mut moved: Vec<(String, String, MemEntry)> = Vec::new();
-        for k in &to_move_keys {
-            if let Some(entry) = entries.remove(k) {
-                let new_key_path = if k == &old_path {
-                    new_path.clone()
-                } else {
-                    let suffix = &k[old_path.len()..];
-                    format!("{}{}", new_path, suffix)
-                };
-
-                moved.push((k.clone(), new_key_path.clone(), entry.clone()));
-            }
-        }
-
-        for (_old_key, new_key, entry) in &moved {
-            entries.insert(new_key.clone(), entry.clone());
-        }
-
-        drop(entries);
+        index.rename_prefix(&old_path, &new_path);
+        drop(index);
         self.persist_index();
 
         Ok(())
