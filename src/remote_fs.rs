@@ -869,14 +869,49 @@ impl FileSystemContext for RemoteFilesystem {
             return Err(FspError::from(STATUS_INVALID_DEVICE_REQUEST));
         }
 
-        let mut all_entries: Vec<(String, bool, u64, u32)> = Vec::new();
-
-        // Always include "." and ".."
-        all_entries.push((".".to_string(), true, 0, FILE_ATTRIBUTE_DIRECTORY.0));
-        all_entries.push(("..".to_string(), true, 0, FILE_ATTRIBUTE_DIRECTORY.0));
-
         let dir_path = &context.path;
         let index = self.index.read().unwrap();
+
+        // Collect directory entries as a flat list: (name, MemEntry).
+        let mut all_entries: Vec<(String, MemEntry)> = Vec::new();
+
+        // "." entry uses the current directory's metadata if available.
+        let dot_entry = if let Some(entry) = index.get(dir_path) {
+            entry.clone()
+        } else {
+            let now = current_filetime();
+            MemEntry {
+                is_dir: true,
+                object_id: None,
+                size: 0,
+                attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                creation_time: now,
+                last_access_time: now,
+                last_write_time: now,
+                change_time: now,
+            }
+        };
+        all_entries.push((".".to_string(), dot_entry));
+
+        // ".." entry uses the parent directory's metadata if available.
+        let parent_path = Self::parent_path(dir_path).unwrap_or_else(|| "\\".to_string());
+        let dotdot_entry = if let Some(entry) = index.get(&parent_path) {
+            entry.clone()
+        } else {
+            let now = current_filetime();
+            MemEntry {
+                is_dir: true,
+                object_id: None,
+                size: 0,
+                attributes: FILE_ATTRIBUTE_DIRECTORY.0,
+                creation_time: now,
+                last_access_time: now,
+                last_write_time: now,
+                change_time: now,
+            }
+        };
+        all_entries.push(("..".to_string(), dotdot_entry));
+
         for (path, entry) in index.entries().iter() {
             if path == dir_path {
                 continue;
@@ -884,8 +919,7 @@ impl FileSystemContext for RemoteFilesystem {
             if let Some(parent) = Self::parent_path(path) {
                 if parent == *dir_path {
                     if let Some(name) = path.rsplit('\\').next() {
-                        let size = if entry.is_dir { 0 } else { entry.size };
-                        all_entries.push((name.to_string(), entry.is_dir, size, entry.attributes));
+                        all_entries.push((name.to_string(), entry.clone()));
                     }
                 }
             }
@@ -897,7 +931,7 @@ impl FileSystemContext for RemoteFilesystem {
         let mut cursor = 0;
         let mut found_marker = marker.is_none();
 
-        for (name, is_dir, size, attrs) in all_entries {
+        for (name, entry) in all_entries {
             let name_owner = U16CString::from_str(&name)
                 .map_err(|_| FspError::from(STATUS_INVALID_DEVICE_REQUEST))?;
             let name_u16 = name_owner.as_ucstr();
@@ -913,15 +947,7 @@ impl FileSystemContext for RemoteFilesystem {
 
             let mut info = DirInfo::<255>::new();
             let finfo = info.file_info_mut();
-            finfo.file_attributes = if is_dir {
-                FILE_ATTRIBUTE_DIRECTORY.0
-            } else {
-                attrs
-            };
-            if !is_dir {
-                finfo.file_size = size;
-                finfo.allocation_size = size;
-            }
+            entry.fill_file_info(finfo);
 
             info.set_name_cstr(name_u16)
                 .map_err(|_| FspError::from(STATUS_INVALID_DEVICE_REQUEST))?;
