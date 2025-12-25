@@ -1,15 +1,110 @@
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 
 use aws_config;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::primitives::ByteStream;
 use tokio::runtime::Runtime;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::S3Config;
 use crate::credentials::load_encrypted_credentials;
 use crate::fs_types::ObjectId;
-use crate::storage::{IndexStore, ObjectStore};
+use crate::storage::{IndexStore, ObjectStore, InMemoryObjectStore};
+
+#[derive(Debug)]
+pub enum S3BgTask {
+    PutObject { key: String, data: Vec<u8> },
+    DeleteObject { key: String },
+    SaveIndex { data: Vec<u8> },
+}
+
+#[derive(Clone, Debug)]
+pub struct S3TaskSender {
+    inner: Arc<Mutex<mpsc::Sender<S3BgTask>>>,
+}
+
+impl S3TaskSender {
+    pub fn new(state: Arc<S3State>) -> Self {
+        let (tx, rx) = mpsc::channel::<S3BgTask>();
+        let inner = Arc::new(Mutex::new(tx));
+
+        let worker_state = state.clone();
+        std::thread::Builder::new()
+            .name("pocket-s3-bg".to_string())
+            .spawn(move || run_s3_background_worker(worker_state, rx))
+            .expect("failed to spawn S3 background worker");
+
+        S3TaskSender { inner }
+    }
+
+    pub fn send(&self, task: S3BgTask) {
+        match self.inner.lock() {
+            Ok(tx) => {
+                if let Err(err) = tx.send(task) {
+                    error!("Failed to enqueue S3 background task: {err}");
+                }
+            }
+            Err(err) => {
+                error!("Failed to lock S3 task sender: {err}");
+            }
+        }
+    }
+}
+
+fn run_s3_background_worker(state: Arc<S3State>, rx: mpsc::Receiver<S3BgTask>) {
+    use std::sync::mpsc::TryRecvError;
+
+    info!("S3 background worker started");
+
+    while let Ok(task) = rx.recv() {
+        match task {
+            S3BgTask::PutObject { key, data } => {
+                debug!("S3 bg: put object {key}");
+                state.upload_object(key, data);
+            }
+            S3BgTask::DeleteObject { key } => {
+                debug!("S3 bg: delete object {key}");
+                state.delete_object(key);
+            }
+            S3BgTask::SaveIndex { data } => {
+                // 合并连续的索引保存请求，只保留最新的那一份。
+                let mut latest = data;
+                loop {
+                    match rx.try_recv() {
+                        Ok(S3BgTask::SaveIndex { data }) => {
+                            latest = data;
+                        }
+                        Ok(S3BgTask::PutObject { key, data }) => {
+                            debug!("S3 bg: put object {key}");
+                            state.upload_object(key, data);
+                        }
+                        Ok(S3BgTask::DeleteObject { key }) => {
+                            debug!("S3 bg: delete object {key}");
+                            state.delete_object(key);
+                        }
+                        Err(TryRecvError::Empty) => {
+                            break;
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            warn!("S3 background worker channel disconnected while coalescing index");
+                            break;
+                        }
+                    }
+                }
+
+                let id = ObjectId::from_data(&latest);
+                let index_key = state.key_for_index_object(&id);
+                state.upload_object(index_key, latest);
+
+                let head_key = state.key_for_index_head();
+                let head_contents = id.to_hex().into_bytes();
+                state.upload_object(head_key, head_contents);
+            }
+        }
+    }
+
+    info!("S3 background worker exiting");
+}
 
 #[derive(Debug)]
 pub struct S3State {
@@ -314,3 +409,82 @@ impl IndexStore for S3IndexStore {
     }
 }
 
+#[derive(Debug)]
+pub struct BufferedObjectStore {
+    local: InMemoryObjectStore,
+    state: Arc<S3State>,
+    task_sender: S3TaskSender,
+}
+
+impl BufferedObjectStore {
+    pub fn new(state: Arc<S3State>, task_sender: S3TaskSender) -> Self {
+        BufferedObjectStore {
+            local: InMemoryObjectStore::new(),
+            state,
+            task_sender,
+        }
+    }
+}
+
+impl ObjectStore for BufferedObjectStore {
+    fn get(&self, id: &ObjectId) -> Option<Vec<u8>> {
+        // 先查本地缓存
+        if let Some(data) = self.local.get(id) {
+            return Some(data);
+        }
+
+        // 未命中则同步从 S3 读取一次并缓存
+        let key = self.state.key_for_data(id);
+        if let Some(bytes) = self.state.get_object_bytes(key) {
+            let generated_id = self.local.put(&bytes);
+            if &generated_id != id {
+                warn!(
+                    "BufferedObjectStore: ObjectId mismatch after caching (expected={}, actual={})",
+                    id, generated_id
+                );
+            }
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+
+    fn put(&self, data: &[u8]) -> ObjectId {
+        let id = self.local.put(data);
+        let key = self.state.key_for_data(&id);
+        self.task_sender
+            .send(S3BgTask::PutObject { key, data: data.to_vec() });
+        id
+    }
+}
+
+#[derive(Debug)]
+pub struct BufferedIndexStore {
+    state: Arc<S3State>,
+    task_sender: S3TaskSender,
+}
+
+impl BufferedIndexStore {
+    pub fn new(state: Arc<S3State>, task_sender: S3TaskSender) -> Self {
+        BufferedIndexStore { state, task_sender }
+    }
+}
+
+impl IndexStore for BufferedIndexStore {
+    fn load_latest(&self) -> Option<Vec<u8>> {
+        // 与 S3IndexStore 相同的加载逻辑：从 head 读取最新快照。
+        let head_key = self.state.key_for_index_head();
+        let head_bytes = self.state.get_object_bytes(head_key)?;
+        let head_str = String::from_utf8(head_bytes).ok()?;
+        let head_str = head_str.trim();
+        let id = ObjectId::from_hex(head_str)?;
+        let index_key = self.state.key_for_index_object(&id);
+        self.state.get_object_bytes(index_key)
+    }
+
+    fn save(&self, data: &[u8]) {
+        // 仅将保存请求排入后台队列，实际写入在后台 worker 中合并处理。
+        self.task_sender
+            .send(S3BgTask::SaveIndex { data: data.to_vec() });
+    }
+}

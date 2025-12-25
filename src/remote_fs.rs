@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Arc, RwLock};
+use std::sync::{mpsc, Arc, RwLock};
+use std::time::Duration;
 
 use sysinfo::{Pid, System};
 use widestring::{U16CStr, U16CString};
@@ -29,10 +30,12 @@ use winfsp::filesystem::{
 use tracing::{debug, error, info, warn};
 use winfsp_sys::FspFileSystemOperationProcessIdF;
 
-use crate::config::{BackendKind, StorageConfig};
-use crate::fs_types::{MemEntry, ObjectId};
+use crate::config::{BackendKind, StorageConfig, S3Mode};
+use crate::fs_types::MemEntry;
 use crate::index_crdt::LoroIndex;
-use crate::s3_backend::{S3IndexStore, S3ObjectStore, S3State};
+use crate::s3_backend::{
+    BufferedIndexStore, BufferedObjectStore, S3IndexStore, S3ObjectStore, S3State, S3TaskSender,
+};
 use crate::storage::{InMemoryIndexStore, InMemoryObjectStore, IndexStore, ObjectStore};
 
 /// Get current time as Windows FILETIME (100-nanosecond intervals since January 1, 1601)
@@ -55,17 +58,70 @@ pub struct RemoteFilesystemFileContext {
 }
 
 pub struct RemoteFilesystem {
-    index: RwLock<LoroIndex>,
+    index: Arc<RwLock<LoroIndex>>,
     security_descriptor: Vec<u8>,
     object_store: Arc<dyn ObjectStore>,
     index_store: Option<Arc<dyn IndexStore>>,
+    index_persister: Option<IndexPersister>,
     process_name_cache: RwLock<HashMap<u32, String>>,
+}
+
+#[derive(Clone)]
+struct IndexPersister {
+    sender: mpsc::Sender<()>,
+}
+
+impl IndexPersister {
+    fn new(
+        index: Arc<RwLock<LoroIndex>>,
+        store: Arc<dyn IndexStore>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let (tx, rx) = mpsc::channel::<()>();
+        let sender = tx.clone();
+
+        std::thread::Builder::new()
+            .name("pocket-index-bg".to_string())
+            .spawn(move || {
+                // 简单的合并节流：收到请求后等待一小段时间，合并更多请求，再做一次快照。
+                let debounce = Duration::from_millis(200);
+                while let Ok(()) = rx.recv() {
+                    // 合并在 debounce 窗口内到达的后续请求。
+                    loop {
+                        match rx.recv_timeout(debounce) {
+                            Ok(()) => {
+                                // 继续合并
+                                continue;
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                break;
+                            }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                return;
+                            }
+                        }
+                    }
+
+                    let bytes = {
+                        let idx = index.read().unwrap();
+                        idx.to_bytes()
+                    };
+                    store.save(&bytes);
+                }
+            })?;
+
+        Ok(IndexPersister { sender })
+    }
+
+    fn request_persist(&self) {
+        let _ = self.sender.send(());
+    }
 }
 
 impl RemoteFilesystem {
     pub fn new(
         storage: &StorageConfig,
         prefix: Option<String>,
+        s3_mode: Option<S3Mode>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let custom_sd = Self::build_user_only_security_descriptor()?;
         if let Ok(custom_sddl) = Self::sd_to_sddl(&custom_sd) {
@@ -94,25 +150,43 @@ impl RemoteFilesystem {
                             let idx = Arc::new(InMemoryIndexStore::new());
                             let now = current_filetime();
                             let index = LoroIndex::new_empty(now, FILE_ATTRIBUTE_DIRECTORY.0);
+                            let index_arc = Arc::new(RwLock::new(index));
+                            let index_persister =
+                                IndexPersister::new(index_arc.clone(), idx.clone()).ok();
                             return Ok(RemoteFilesystem {
-                                index: RwLock::new(index),
+                                index: index_arc,
                                 security_descriptor,
                                 object_store: obj,
                                 index_store: Some(idx),
+                                index_persister,
                                 process_name_cache: RwLock::new(HashMap::new()),
                             });
                         }
                     };
 
                     let s3_state = Arc::new(S3State::new(s3_cfg, prefix.clone())?);
+                    let prefix_str = prefix.unwrap_or_default();
+                    let mode = s3_mode.or(s3_cfg.mode).unwrap_or(S3Mode::Sync);
+
                     info!(
-                        "S3 backend enabled, bucket={}, prefix={}",
-                        s3_cfg.bucket,
-                        prefix.unwrap_or_default()
+                        "S3 backend enabled, bucket={}, prefix={}, mode={:?}",
+                        s3_cfg.bucket, prefix_str, mode
                     );
-                    let obj = Arc::new(S3ObjectStore::new(s3_state.clone()));
-                    let idx = Arc::new(S3IndexStore::new(s3_state));
-                    (obj, Some(idx))
+
+                    match mode {
+                        S3Mode::Sync => {
+                            let obj = Arc::new(S3ObjectStore::new(s3_state.clone()));
+                            let idx = Arc::new(S3IndexStore::new(s3_state));
+                            (obj, Some(idx))
+                        }
+                        S3Mode::Buffered => {
+                            let task_sender = S3TaskSender::new(s3_state.clone());
+                            let obj =
+                                Arc::new(BufferedObjectStore::new(s3_state.clone(), task_sender.clone()));
+                            let idx = Arc::new(BufferedIndexStore::new(s3_state, task_sender));
+                            (obj, Some(idx))
+                        }
+                    }
                 }
             };
 
@@ -133,11 +207,25 @@ impl RemoteFilesystem {
             LoroIndex::new_empty(now, FILE_ATTRIBUTE_DIRECTORY.0)
         };
 
+        let index_arc = Arc::new(RwLock::new(index));
+        let index_persister = if let Some(store) = &index_store {
+            match IndexPersister::new(index_arc.clone(), store.clone()) {
+                Ok(p) => Some(p),
+                Err(err) => {
+                    error!("Failed to start index persister, falling back to sync snapshotting: {err}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(RemoteFilesystem {
-            index: RwLock::new(index),
+            index: index_arc,
             security_descriptor,
             object_store,
             index_store,
+            index_persister,
             process_name_cache: RwLock::new(HashMap::new()),
         })
     }
@@ -325,7 +413,9 @@ impl RemoteFilesystem {
     }
 
     fn persist_index(&self) {
-        if let Some(store) = &self.index_store {
+        if let Some(persister) = &self.index_persister {
+            persister.request_persist();
+        } else if let Some(store) = &self.index_store {
             let index = self.index.read().unwrap();
             let bytes = index.to_bytes();
             store.save(&bytes);
@@ -646,7 +736,6 @@ impl FileSystemContext for RemoteFilesystem {
 
         index.upsert_entry(&context.path, updated);
         drop(index);
-        self.persist_index();
         Ok(())
     }
 

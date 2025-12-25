@@ -84,11 +84,11 @@ pub fn run_main() -> Result<(), Box<dyn std::error::Error>> {
     for (m, storage) in mounts {
         let mount_path = expand_mount_path(&m.mount_path);
         info!(
-            "Initializing mount: name={:?}, path={}, backend={:?}",
-            m.name, mount_path, storage.backend
+            "Initializing mount: name={:?}, path={}, backend={:?}, mode={:?}",
+            m.name, mount_path, storage.backend, m.mode
         );
 
-        let fs = RemoteFilesystem::new(&storage, m.prefix)?;
+        let fs = RemoteFilesystem::new(&storage, m.prefix, m.mode)?;
         let params = build_volume_params();
         let mut host = FileSystemHost::new(params, fs)?;
         host.mount(&mount_path)?;

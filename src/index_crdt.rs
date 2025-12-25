@@ -31,7 +31,7 @@ impl LoroIndex {
         );
 
         let doc = LoroDoc::new();
-        let mut index = LoroIndex { entries, doc };
+        let index = LoroIndex { entries, doc };
         index.sync_doc_from_entries();
         index
     }

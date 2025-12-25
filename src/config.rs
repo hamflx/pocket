@@ -19,6 +19,13 @@ impl Default for BackendKind {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum S3Mode {
+    Sync,
+    Buffered,
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct S3Config {
     pub bucket: String,
@@ -33,6 +40,9 @@ pub struct S3Config {
     /// Base name (without extension) of encrypted credential file
     #[serde(default)]
     pub credentials: Option<String>,
+    /// S3 I/O mode: sync (default) or buffered
+    #[serde(default)]
+    pub mode: Option<S3Mode>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -48,6 +58,9 @@ pub struct MountConfig {
     /// Optional identifier for logging / CLI
     #[serde(default)]
     pub name: Option<String>,
+    /// Optional backend mode override for this mount (e.g. S3 buffered/sync)
+    #[serde(default)]
+    pub mode: Option<S3Mode>,
     /// Local directory path to mount on, e.g. `C:\Users\alice\.ssh`
     pub mount_path: String,
     /// Name of storage backend to use
@@ -200,4 +213,3 @@ mod tests {
         assert_eq!(mounts[0].0.name.as_deref(), Some("mem"));
     }
 }
-

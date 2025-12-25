@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use directories::ProjectDirs;
 use tracing::{debug, info, warn};
 
-use crate::config::{AppConfig, BackendKind, S3Config, StorageConfig, config_path};
+use crate::config::{AppConfig, BackendKind, S3Config, S3Mode, StorageConfig, config_path};
 use crate::credentials::store_encrypted_credentials;
 
 #[derive(Parser, Debug)]
@@ -93,6 +93,7 @@ fn handle_config_s3(args: ConfigS3Args) -> Result<(), Box<dyn std::error::Error>
                 region: args.region,
                 endpoint: args.endpoint,
                 credentials: Some(args.credentials),
+                mode: Some(S3Mode::Sync),
             }),
         },
     );
