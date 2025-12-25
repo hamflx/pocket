@@ -1,18 +1,18 @@
 use clap::Parser;
 use tracing::{error, info};
 
+mod cli;
 mod config;
 mod credentials;
-mod index_crdt;
 mod fs_types;
-mod storage;
-mod s3_backend;
+mod index_crdt;
 mod remote_fs;
+mod s3_backend;
 mod service;
-mod cli;
+mod storage;
 
-pub use remote_fs::RemoteFilesystem;
 pub use fs_types::MemEntry;
+pub use remote_fs::RemoteFilesystem;
 
 fn main() {
     // 初始化 tracing 日志，输出到日志文件
@@ -74,4 +74,11 @@ fn main() {
         // 退出时返回非零表示错误
         std::process::exit(1);
     }
+}
+
+#[test]
+fn test_canonicalize() {
+    let path = std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap()).join(".ssh");
+    let canonical_path = path.canonicalize().unwrap();
+    assert_eq!(canonical_path, path);
 }
