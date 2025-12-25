@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{mpsc, Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::time::Duration;
 
 use sysinfo::{Pid, System};
@@ -30,7 +30,7 @@ use winfsp::filesystem::{
 use tracing::{debug, error, info, warn};
 use winfsp_sys::FspFileSystemOperationProcessIdF;
 
-use crate::config::{BackendKind, StorageConfig, S3Mode};
+use crate::config::{BackendKind, S3Mode, StorageConfig};
 use crate::fs_types::MemEntry;
 use crate::index_crdt::LoroIndex;
 use crate::s3_backend::{
@@ -55,6 +55,7 @@ pub struct RemoteFilesystemFileContext {
     path: String,
     is_dir: bool,
     pid: Option<u32>,
+    buffer: Option<Arc<Mutex<FileBuffer>>>,
 }
 
 pub struct RemoteFilesystem {
@@ -64,6 +65,14 @@ pub struct RemoteFilesystem {
     index_store: Option<Arc<dyn IndexStore>>,
     index_persister: Option<IndexPersister>,
     process_name_cache: RwLock<HashMap<u32, String>>,
+    file_buffers: RwLock<HashMap<String, Arc<Mutex<FileBuffer>>>>,
+}
+
+#[derive(Debug)]
+struct FileBuffer {
+    data: Vec<u8>,
+    dirty: bool,
+    deleted: bool,
 }
 
 #[derive(Clone)]
@@ -160,6 +169,7 @@ impl RemoteFilesystem {
                                 index_store: Some(idx),
                                 index_persister,
                                 process_name_cache: RwLock::new(HashMap::new()),
+                                file_buffers: RwLock::new(HashMap::new()),
                             });
                         }
                     };
@@ -181,8 +191,10 @@ impl RemoteFilesystem {
                         }
                         S3Mode::Buffered => {
                             let task_sender = S3TaskSender::new(s3_state.clone());
-                            let obj =
-                                Arc::new(BufferedObjectStore::new(s3_state.clone(), task_sender.clone()));
+                            let obj = Arc::new(BufferedObjectStore::new(
+                                s3_state.clone(),
+                                task_sender.clone(),
+                            ));
                             let idx = Arc::new(BufferedIndexStore::new(s3_state, task_sender));
                             (obj, Some(idx))
                         }
@@ -212,7 +224,9 @@ impl RemoteFilesystem {
             match IndexPersister::new(index_arc.clone(), store.clone()) {
                 Ok(p) => Some(p),
                 Err(err) => {
-                    error!("Failed to start index persister, falling back to sync snapshotting: {err}");
+                    error!(
+                        "Failed to start index persister, falling back to sync snapshotting: {err}"
+                    );
                     None
                 }
             }
@@ -227,6 +241,7 @@ impl RemoteFilesystem {
             index_store,
             index_persister,
             process_name_cache: RwLock::new(HashMap::new()),
+            file_buffers: RwLock::new(HashMap::new()),
         })
     }
 
@@ -239,6 +254,11 @@ impl RemoteFilesystem {
         } else {
             format!(r"\{}", s)
         }
+    }
+
+    fn should_buffer_file(path: &str, is_dir: bool) -> bool {
+        debug!("should_buffer_file: path={} is_dir={}", path, is_dir);
+        !is_dir
     }
 
     fn parent_path(path: &str) -> Option<String> {
@@ -486,6 +506,24 @@ impl FileSystemContext for RemoteFilesystem {
 
             debug!("open: file_info: {:?}", fi);
 
+            let buffer = if Self::should_buffer_file(&path, entry.is_dir) {
+                let mut buffers = self.file_buffers.write().unwrap();
+                if let Some(buf) = buffers.get(&path) {
+                    Some(buf.clone())
+                } else {
+                    let data = self.load_file_data(entry);
+                    let buf = Arc::new(Mutex::new(FileBuffer {
+                        data,
+                        dirty: false,
+                        deleted: false,
+                    }));
+                    buffers.insert(path.clone(), buf.clone());
+                    Some(buf)
+                }
+            } else {
+                None
+            };
+
             Ok(RemoteFilesystemFileContext {
                 path,
                 is_dir: entry.is_dir,
@@ -493,6 +531,7 @@ impl FileSystemContext for RemoteFilesystem {
                     0 => None,
                     pid => Some(pid),
                 },
+                buffer,
             })
         } else {
             debug!("open: not found");
@@ -500,7 +539,47 @@ impl FileSystemContext for RemoteFilesystem {
         }
     }
 
-    fn close(&self, _context: Self::FileContext) {}
+    fn close(&self, context: Self::FileContext) {
+        if context.is_dir {
+            return;
+        }
+
+        if let Some(buf_mutex) = &context.buffer {
+            let mut buf = match buf_mutex.lock() {
+                Ok(b) => b,
+                Err(_) => {
+                    warn!("close: failed to lock file buffer for {}", context.path);
+                    return;
+                }
+            };
+
+            if !buf.dirty || buf.deleted {
+                return;
+            }
+
+            let data = &buf.data;
+            let mut index = self.index.write().unwrap();
+            if let Some(entry) = index.get_mut(&context.path) {
+                let now = current_filetime();
+                entry.last_write_time = now;
+                entry.change_time = now;
+                entry.size = data.len() as u64;
+
+                if !data.is_empty() {
+                    let id = self.object_store.put(data);
+                    entry.object_id = Some(id);
+                } else {
+                    entry.object_id = None;
+                }
+
+                let updated = entry.clone();
+                index.upsert_entry(&context.path, updated);
+                drop(index);
+                buf.dirty = false;
+                self.persist_index();
+            }
+        }
+    }
 
     fn flush(
         &self,
@@ -590,6 +669,23 @@ impl FileSystemContext for RemoteFilesystem {
         drop(index);
         self.persist_index();
 
+        let buffer = if Self::should_buffer_file(&path, resulting_is_dir) && !resulting_is_dir {
+            let mut buffers = self.file_buffers.write().unwrap();
+            if let Some(buf) = buffers.get(&path) {
+                Some(buf.clone())
+            } else {
+                let buf = Arc::new(Mutex::new(FileBuffer {
+                    data: Vec::new(),
+                    dirty: false,
+                    deleted: false,
+                }));
+                buffers.insert(path.clone(), buf.clone());
+                Some(buf)
+            }
+        } else {
+            None
+        };
+
         Ok(RemoteFilesystemFileContext {
             path,
             is_dir: resulting_is_dir,
@@ -597,11 +693,19 @@ impl FileSystemContext for RemoteFilesystem {
                 0 => None,
                 pid => Some(pid),
             },
+            buffer,
         })
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
         if FspCleanupFlags::FspCleanupDelete.is_flagged(flags) {
+            if let Some(buf_mutex) = &context.buffer {
+                if let Ok(mut buf) = buf_mutex.lock() {
+                    buf.deleted = true;
+                    buf.dirty = false;
+                }
+            }
+
             let path = file_name
                 .map(Self::normalize_path)
                 .unwrap_or_else(|| context.path.clone());
@@ -611,6 +715,49 @@ impl FileSystemContext for RemoteFilesystem {
             index.delete_path_recursive(&path);
             drop(index);
             self.persist_index();
+
+            // 删除时清理共享缓冲。
+            let mut buffers = self.file_buffers.write().unwrap();
+            buffers.remove(&path);
+            return;
+        }
+
+        // 非删除场景下，Cleanup 表示句柄关闭，此时需要将缓冲内容持久化，
+        // 保证后续新的打开可以看到完整数据。
+        if let Some(buf_mutex) = &context.buffer {
+            let mut buf = match buf_mutex.lock() {
+                Ok(b) => b,
+                Err(_) => {
+                    warn!("cleanup: failed to lock file buffer for {}", context.path);
+                    return;
+                }
+            };
+
+            if !buf.dirty || buf.deleted {
+                return;
+            }
+
+            let data = &buf.data;
+            let mut index = self.index.write().unwrap();
+            if let Some(entry) = index.get_mut(&context.path) {
+                let now = current_filetime();
+                entry.last_write_time = now;
+                entry.change_time = now;
+                entry.size = data.len() as u64;
+
+                if !data.is_empty() {
+                    let id = self.object_store.put(data);
+                    entry.object_id = Some(id);
+                } else {
+                    entry.object_id = None;
+                }
+
+                let updated = entry.clone();
+                index.upsert_entry(&context.path, updated);
+                drop(index);
+                buf.dirty = false;
+                self.persist_index();
+            }
         }
     }
 
@@ -762,49 +909,84 @@ impl FileSystemContext for RemoteFilesystem {
             return Err(FspError::from(STATUS_INVALID_DEVICE_REQUEST));
         }
 
-        let mut index = self.index.write().unwrap();
-        let updated = {
-            let data = {
-                let entry = index
-                    .get(&context.path)
-                    .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
-                self.load_file_data(entry)
-            };
-            let entry = index
-                .get_mut(&context.path)
-                .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+        if let Some(buf_mutex) = &context.buffer {
+            let mut buf = buf_mutex
+                .lock()
+                .map_err(|_| FspError::from(STATUS_INVALID_DEVICE_REQUEST))?;
 
+            let data = &mut buf.data;
             let new_len = new_size as usize;
-            let mut new_data = data;
-            if new_len < new_data.len() {
-                new_data.truncate(new_len);
-            } else if new_len > new_data.len() {
-                new_data.resize(new_len, 0);
+            if new_len < data.len() {
+                data.truncate(new_len);
+            } else if new_len > data.len() {
+                data.resize(new_len, 0);
             }
 
-            // Update timestamps on size change
             let now = current_filetime();
-            entry.last_write_time = now;
-            entry.change_time = now;
-            entry.size = new_size;
+            let mut index = self.index.write().unwrap();
+            let updated = {
+                let entry = index
+                    .get_mut(&context.path)
+                    .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
 
-            if !entry.is_dir {
-                if new_len == 0 {
-                    entry.object_id = None;
-                } else {
-                    let id = self.object_store.put(&new_data);
-                    entry.object_id = Some(id);
+                entry.last_write_time = now;
+                entry.change_time = now;
+                entry.size = new_size;
+
+                entry.fill_file_info(file_info);
+                entry.clone()
+            };
+            index.upsert_entry(&context.path, updated);
+            drop(index);
+
+            buf.dirty = true;
+            // 对缓冲文件，实际落盘由 close() 负责，这里不必强制 snapshot。
+            Ok(())
+        } else {
+            let mut index = self.index.write().unwrap();
+            let updated = {
+                let data = {
+                    let entry = index
+                        .get(&context.path)
+                        .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+                    self.load_file_data(entry)
+                };
+                let entry = index
+                    .get_mut(&context.path)
+                    .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+
+                let new_len = new_size as usize;
+                let mut new_data = data;
+                if new_len < new_data.len() {
+                    new_data.truncate(new_len);
+                } else if new_len > new_data.len() {
+                    new_data.resize(new_len, 0);
                 }
-            }
 
-            entry.fill_file_info(file_info);
-            entry.clone()
-        };
+                // Update timestamps on size change
+                let now = current_filetime();
+                entry.last_write_time = now;
+                entry.change_time = now;
+                entry.size = new_size;
 
-        index.upsert_entry(&context.path, updated);
-        drop(index);
-        self.persist_index();
-        Ok(())
+                if !entry.is_dir {
+                    if new_len == 0 {
+                        entry.object_id = None;
+                    } else {
+                        let id = self.object_store.put(&new_data);
+                        entry.object_id = Some(id);
+                    }
+                }
+
+                entry.fill_file_info(file_info);
+                entry.clone()
+            };
+
+            index.upsert_entry(&context.path, updated);
+            drop(index);
+            self.persist_index();
+            Ok(())
+        }
     }
 
     fn read(
@@ -827,22 +1009,38 @@ impl FileSystemContext for RemoteFilesystem {
             return Err(FspError::from(STATUS_INVALID_DEVICE_REQUEST));
         }
 
-        let index = self.index.read().unwrap();
-        let entry = index
-            .get(&context.path)
-            .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+        if let Some(buf_mutex) = &context.buffer {
+            let buf = buf_mutex
+                .lock()
+                .map_err(|_| FspError::from(STATUS_INVALID_DEVICE_REQUEST))?;
+            let data = &buf.data;
+            let offset = offset as usize;
+            if offset >= data.len() {
+                debug!("read: offset out of range");
+                return Err(FspError::from(ERROR_HANDLE_EOF));
+            }
 
-        let data = self.load_file_data(entry);
-        let offset = offset as usize;
-        if offset >= data.len() {
-            debug!("read: offset out of range");
-            return Err(FspError::from(ERROR_HANDLE_EOF));
+            let len = buffer.len().min(data.len() - offset);
+            buffer[..len].copy_from_slice(&data[offset..offset + len]);
+            Ok(len as u32)
+        } else {
+            let index = self.index.read().unwrap();
+            let entry = index
+                .get(&context.path)
+                .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+
+            let data = self.load_file_data(entry);
+            let offset = offset as usize;
+            if offset >= data.len() {
+                debug!("read: offset out of range");
+                return Err(FspError::from(ERROR_HANDLE_EOF));
+            }
+
+            let len = buffer.len().min(data.len() - offset);
+            buffer[..len].copy_from_slice(&data[offset..offset + len]);
+
+            Ok(len as u32)
         }
-
-        let len = buffer.len().min(data.len() - offset);
-        buffer[..len].copy_from_slice(&data[offset..offset + len]);
-
-        Ok(len as u32)
     }
 
     fn write(
@@ -865,32 +1063,129 @@ impl FileSystemContext for RemoteFilesystem {
             return Err(FspError::from(STATUS_INVALID_DEVICE_REQUEST));
         }
 
-        let mut index = self.index.write().unwrap();
-        let mut data = {
-            let entry = index
-                .get(&context.path)
-                .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
-            self.load_file_data(entry)
-        };
-        let entry = index
-            .get_mut(&context.path)
-            .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+        if let Some(buf_mutex) = &context.buffer {
+            let mut buf = buf_mutex
+                .lock()
+                .map_err(|_| FspError::from(STATUS_INVALID_DEVICE_REQUEST))?;
+            let data = &mut buf.data;
 
-        let write_offset = if write_to_eof {
-            data.len()
-        } else {
-            offset as usize
-        };
+            let write_offset = if write_to_eof {
+                data.len()
+            } else {
+                offset as usize
+            };
 
-        if constrained_io {
-            if write_offset >= data.len() {
-                return Ok(0);
+            if constrained_io {
+                if write_offset >= data.len() {
+                    return Ok(0);
+                }
+                let max_len = data.len() - write_offset;
+                let write_len = buffer.len().min(max_len);
+                data[write_offset..write_offset + write_len].copy_from_slice(&buffer[..write_len]);
+
+                let now = current_filetime();
+                let mut index = self.index.write().unwrap();
+                let updated = {
+                    let entry = index
+                        .get_mut(&context.path)
+                        .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+
+                    entry.last_access_time = now;
+                    entry.last_write_time = now;
+                    entry.change_time = now;
+                    entry.size = data.len() as u64;
+
+                    entry.fill_file_info(file_info);
+                    entry.clone()
+                };
+                index.upsert_entry(&context.path, updated);
+                drop(index);
+
+                buf.dirty = true;
+                // 内容实际落盘由 close() 负责。
+                return Ok(write_len as u32);
             }
-            let max_len = data.len() - write_offset;
-            let write_len = buffer.len().min(max_len);
-            data[write_offset..write_offset + write_len].copy_from_slice(&buffer[..write_len]);
 
-            // Update timestamps on write
+            let end = write_offset.saturating_add(buffer.len());
+            if end > data.len() {
+                data.resize(end, 0);
+            }
+            data[write_offset..write_offset + buffer.len()].copy_from_slice(buffer);
+
+            let now = current_filetime();
+            let mut index = self.index.write().unwrap();
+            let updated = {
+                let entry = index
+                    .get_mut(&context.path)
+                    .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+
+                entry.last_access_time = now;
+                entry.last_write_time = now;
+                entry.change_time = now;
+                entry.size = data.len() as u64;
+
+                entry.fill_file_info(file_info);
+                entry.clone()
+            };
+            index.upsert_entry(&context.path, updated);
+            drop(index);
+
+            buf.dirty = true;
+            // 内容实际落盘由 close() 负责。
+            Ok(buffer.len() as u32)
+        } else {
+            let mut index = self.index.write().unwrap();
+            let mut data = {
+                let entry = index
+                    .get(&context.path)
+                    .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+                self.load_file_data(entry)
+            };
+            let entry = index
+                .get_mut(&context.path)
+                .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+
+            let write_offset = if write_to_eof {
+                data.len()
+            } else {
+                offset as usize
+            };
+
+            if constrained_io {
+                if write_offset >= data.len() {
+                    return Ok(0);
+                }
+                let max_len = data.len() - write_offset;
+                let write_len = buffer.len().min(max_len);
+                data[write_offset..write_offset + write_len].copy_from_slice(&buffer[..write_len]);
+
+                let now = current_filetime();
+                entry.last_access_time = now;
+                entry.last_write_time = now;
+                entry.change_time = now;
+                entry.size = data.len() as u64;
+
+                if !data.is_empty() {
+                    let id = self.object_store.put(&data);
+                    entry.object_id = Some(id);
+                } else {
+                    entry.object_id = None;
+                }
+
+                entry.fill_file_info(file_info);
+                let updated = entry.clone();
+                index.upsert_entry(&context.path, updated);
+                drop(index);
+                self.persist_index();
+                return Ok(write_len as u32);
+            }
+
+            let end = write_offset.saturating_add(buffer.len());
+            if end > data.len() {
+                data.resize(end, 0);
+            }
+            data[write_offset..write_offset + buffer.len()].copy_from_slice(buffer);
+
             let now = current_filetime();
             entry.last_access_time = now;
             entry.last_write_time = now;
@@ -909,35 +1204,8 @@ impl FileSystemContext for RemoteFilesystem {
             index.upsert_entry(&context.path, updated);
             drop(index);
             self.persist_index();
-            return Ok(write_len as u32);
+            Ok(buffer.len() as u32)
         }
-
-        let end = write_offset.saturating_add(buffer.len());
-        if end > data.len() {
-            data.resize(end, 0);
-        }
-        data[write_offset..write_offset + buffer.len()].copy_from_slice(buffer);
-
-        // Update timestamps on write
-        let now = current_filetime();
-        entry.last_access_time = now;
-        entry.last_write_time = now;
-        entry.change_time = now;
-        entry.size = data.len() as u64;
-
-        if !data.is_empty() {
-            let id = self.object_store.put(&data);
-            entry.object_id = Some(id);
-        } else {
-            entry.object_id = None;
-        }
-
-        entry.fill_file_info(file_info);
-        let updated = entry.clone();
-        index.upsert_entry(&context.path, updated);
-        drop(index);
-        self.persist_index();
-        Ok(buffer.len() as u32)
     }
 
     fn read_directory(
