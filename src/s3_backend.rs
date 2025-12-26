@@ -1,4 +1,5 @@
-use std::sync::{mpsc, Arc, Mutex};
+use std::collections::VecDeque;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 use aws_config;
 use aws_sdk_s3::Client as S3Client;
@@ -16,6 +17,7 @@ pub enum S3BgTask {
     PutObject { key: String, data: Vec<u8> },
     DeleteObject { key: String },
     SaveIndex { data: Vec<u8> },
+    Shutdown,
 }
 
 #[derive(Clone, Debug)]
@@ -54,33 +56,110 @@ impl S3TaskSender {
 fn run_s3_background_worker(state: Arc<S3State>, rx: mpsc::Receiver<S3BgTask>) {
     use std::sync::mpsc::TryRecvError;
 
-    info!("S3 background worker started");
+    // 为 S3 操作增加并发度：使用一个共享任务队列 + 固定大小的 worker 线程池。
+    const S3_WORKER_CONCURRENCY: usize = 10;
 
+    // 共享任务队列，所有 worker 从中抢任务。
+    let task_queue: Arc<(Mutex<VecDeque<S3BgTask>>, Condvar)> =
+        Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+
+    // 启动 worker 线程池。
+    let mut worker_handles = Vec::new();
+    for i in 0..S3_WORKER_CONCURRENCY {
+        let worker_state = state.clone();
+        let queue = task_queue.clone();
+        std::thread::Builder::new()
+            .name(format!("pocket-s3-worker-{i}"))
+            .spawn(move || {
+                loop {
+                    let task = {
+                        let (lock, cv) = &*queue;
+                        let mut guard = lock.lock().unwrap();
+                        loop {
+                            if let Some(task) = guard.pop_front() {
+                                break task;
+                            }
+                            guard = cv.wait(guard).unwrap();
+                        }
+                    };
+
+                    match task {
+                        S3BgTask::PutObject { key, data } => {
+                            debug!("S3 worker {i}: put object {key}");
+                            worker_state.upload_object(key, data);
+                        }
+                        S3BgTask::DeleteObject { key } => {
+                            debug!("S3 worker {i}: delete object {key}");
+                            worker_state.delete_object(key);
+                        }
+                        S3BgTask::SaveIndex { data } => {
+                            // SaveIndex 在调度层已经做了合并，这里只负责真正写入快照。
+                            let id = ObjectId::from_data(&data);
+                            let index_key = worker_state.key_for_index_object(&id);
+                            worker_state.upload_object(index_key, data);
+
+                            let head_key = worker_state.key_for_index_head();
+                            let head_contents = id.to_hex().into_bytes();
+                            worker_state.upload_object(head_key, head_contents);
+                        }
+                        S3BgTask::Shutdown => {
+                            debug!("S3 worker {i}: shutdown");
+                            break;
+                        }
+                    }
+                }
+            })
+            .expect("failed to spawn S3 worker thread");
+
+        worker_handles.push(());
+    }
+
+    info!(
+        "S3 background worker started with {} concurrent workers",
+        S3_WORKER_CONCURRENCY
+    );
+
+    // 调度线程：从主队列读取任务，做 SaveIndex 合并，并将任务放入共享队列，由 worker 并发执行。
     while let Ok(task) = rx.recv() {
         match task {
             S3BgTask::PutObject { key, data } => {
-                debug!("S3 bg: put object {key}");
-                state.upload_object(key, data);
+                let (lock, cv) = &*task_queue;
+                let mut guard = lock.lock().unwrap();
+                guard.push_back(S3BgTask::PutObject { key, data });
+                cv.notify_one();
             }
             S3BgTask::DeleteObject { key } => {
-                debug!("S3 bg: delete object {key}");
-                state.delete_object(key);
+                let (lock, cv) = &*task_queue;
+                let mut guard = lock.lock().unwrap();
+                guard.push_back(S3BgTask::DeleteObject { key });
+                cv.notify_one();
             }
             S3BgTask::SaveIndex { data } => {
-                // 合并连续的索引保存请求，只保留最新的那一份。
+                // SaveIndex 涉及 head 指针更新，必须保证顺序一致性：
+                // 这里在调度线程中做合并 + 同步写入，避免并发写 head。
                 let mut latest = data;
                 loop {
                     match rx.try_recv() {
                         Ok(S3BgTask::SaveIndex { data }) => {
+                            // 只保留最新的索引快照
                             latest = data;
                         }
                         Ok(S3BgTask::PutObject { key, data }) => {
-                            debug!("S3 bg: put object {key}");
-                            state.upload_object(key, data);
+                            // 数据写入可以立即放入队列，由 worker 并行执行
+                            let (lock, cv) = &*task_queue;
+                            let mut guard = lock.lock().unwrap();
+                            guard.push_back(S3BgTask::PutObject { key, data });
+                            cv.notify_one();
                         }
                         Ok(S3BgTask::DeleteObject { key }) => {
-                            debug!("S3 bg: delete object {key}");
-                            state.delete_object(key);
+                            let (lock, cv) = &*task_queue;
+                            let mut guard = lock.lock().unwrap();
+                            guard.push_back(S3BgTask::DeleteObject { key });
+                            cv.notify_one();
+                        }
+                        Ok(S3BgTask::Shutdown) => {
+                            // 不期望从主通道收到 Shutdown，这里视为结束合并。
+                            break;
                         }
                         Err(TryRecvError::Empty) => {
                             break;
@@ -92,6 +171,7 @@ fn run_s3_background_worker(state: Arc<S3State>, rx: mpsc::Receiver<S3BgTask>) {
                     }
                 }
 
+                // 在调度线程中同步写入索引快照和 head，保证 head 总是指向最新快照。
                 let id = ObjectId::from_data(&latest);
                 let index_key = state.key_for_index_object(&id);
                 state.upload_object(index_key, latest);
@@ -100,7 +180,20 @@ fn run_s3_background_worker(state: Arc<S3State>, rx: mpsc::Receiver<S3BgTask>) {
                 let head_contents = id.to_hex().into_bytes();
                 state.upload_object(head_key, head_contents);
             }
+            S3BgTask::Shutdown => {
+                // 不会从外部收到 Shutdown，这里可以忽略。
+            }
         }
+    }
+
+    // 主队列关闭后，向所有 worker 发送 Shutdown，结束线程。
+    {
+        let (lock, cv) = &*task_queue;
+        let mut guard = lock.lock().unwrap();
+        for _ in 0..S3_WORKER_CONCURRENCY {
+            guard.push_back(S3BgTask::Shutdown);
+        }
+        cv.notify_all();
     }
 
     info!("S3 background worker exiting");

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, RwLock, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, System};
 use widestring::{U16CStr, U16CString};
@@ -130,14 +130,21 @@ impl IndexPersister {
         std::thread::Builder::new()
             .name("pocket-index-bg".to_string())
             .spawn(move || {
-                // 简单的合并节流：收到请求后等待一小段时间，合并更多请求，再做一次快照。
+                // 合并短时间内的多次请求，但保证在连续写入的情况下
+                // 至少每 debounce 周期落一次快照，而不是依赖“空闲窗口”。
                 let debounce = Duration::from_millis(200);
                 while let Ok(()) = rx.recv() {
-                    // 合并在 debounce 窗口内到达的后续请求。
+                    let start = Instant::now();
+                    // 在一个固定的时间窗口内合并更多请求。
                     loop {
-                        match rx.recv_timeout(debounce) {
+                        let elapsed = start.elapsed();
+                        if elapsed >= debounce {
+                            break;
+                        }
+                        let remaining = debounce - elapsed;
+                        match rx.recv_timeout(remaining) {
                             Ok(()) => {
-                                // 继续合并
+                                // 同一个窗口内继续合并，不额外记录次数。
                                 continue;
                             }
                             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -182,10 +189,10 @@ impl RemoteFilesystem {
         let (object_store, index_store): (Arc<dyn ObjectStore>, Option<Arc<dyn IndexStore>>) =
             match storage.backend {
                 BackendKind::Memory => {
-                    info!("Using in-memory backend");
+                    info!("Using in-memory backend (no index persistence)");
                     let obj = Arc::new(InMemoryObjectStore::new());
-                    let idx = Arc::new(InMemoryIndexStore::new());
-                    (obj, Some(idx))
+                    // 纯内存后端：仍然使用 LoroIndex 做 CRDT 验证，但不做持久化。
+                    (obj, None)
                 }
                 BackendKind::S3 => {
                     let s3_cfg = match storage.s3 {
@@ -478,7 +485,7 @@ impl RemoteFilesystem {
 
         let data = &buf.data;
         let mut index = self.index.write().unwrap();
-        if let Some(entry) = index.get_mut(path) {
+        if index.update_entry(path, |entry| {
             let now = current_filetime();
             entry.last_write_time = now;
             entry.change_time = now;
@@ -490,9 +497,7 @@ impl RemoteFilesystem {
             } else {
                 entry.object_id = None;
             }
-
-            let updated = entry.clone();
-            index.upsert_entry(path, updated);
+        }) {
             drop(index);
             buf.dirty = false;
             self.persist_index();
@@ -523,8 +528,7 @@ impl FileSystemContext for RemoteFilesystem {
         debug!("get_security_by_name: {}", path);
 
         let index = self.index.read().unwrap();
-        let entries = index.entries();
-        let attributes = if let Some(entry) = entries.get(&path) {
+        let attributes = if let Some(entry) = index.get(&path) {
             entry.attributes
         } else if path == "\\" {
             FILE_ATTRIBUTE_DIRECTORY.0
@@ -666,23 +670,24 @@ impl FileSystemContext for RemoteFilesystem {
 
         let parent = Self::parent_path(&path).unwrap_or_else(|| "\\".to_string());
         let mut index = self.index.write().unwrap();
-        let entries = index.entries_mut();
-
-        if !entries.contains_key(&parent) {
+        if !index.contains_path(&parent) {
             return Err(FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
 
         let now = current_filetime();
-        let entry = entries.entry(path.clone()).or_insert(MemEntry {
-            is_dir,
-            object_id: None,
-            size: 0,
-            attributes: file_attributes,
-            creation_time: now,
-            last_access_time: now,
-            last_write_time: now,
-            change_time: now,
-        });
+        let mut entry = index
+            .get(&path)
+            .cloned()
+            .unwrap_or(MemEntry {
+                is_dir,
+                object_id: None,
+                size: 0,
+                attributes: file_attributes,
+                creation_time: now,
+                last_access_time: now,
+                last_write_time: now,
+                change_time: now,
+            });
 
         entry.is_dir = is_dir;
         entry.attributes = file_attributes;
@@ -702,6 +707,7 @@ impl FileSystemContext for RemoteFilesystem {
 
         let resulting_is_dir = entry.is_dir;
 
+        index.upsert_entry(&path, entry);
         drop(index);
         self.persist_index();
 
@@ -858,11 +864,10 @@ impl FileSystemContext for RemoteFilesystem {
         );
 
         let mut index = self.index.write().unwrap();
-        let updated = {
-            let entry = index
-                .get_mut(&context.path)
-                .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
-
+        if !index.contains_path(&context.path) {
+            return Err(FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
+        }
+        index.update_entry(&context.path, |entry| {
             // INVALID_FILE_ATTRIBUTES (0xFFFFFFFF) means "don't change"
             if file_attributes != u32::MAX {
                 entry.attributes = file_attributes;
@@ -882,10 +887,7 @@ impl FileSystemContext for RemoteFilesystem {
             }
 
             entry.fill_file_info(file_info);
-            entry.clone()
-        };
-
-        index.upsert_entry(&context.path, updated);
+        });
         drop(index);
         Ok(())
     }
@@ -928,19 +930,16 @@ impl FileSystemContext for RemoteFilesystem {
 
             let now = current_filetime();
             let mut index = self.index.write().unwrap();
-            let updated = {
-                let entry = index
-                    .get_mut(&context.path)
-                    .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
-
+            if !index.contains_path(&context.path) {
+                return Err(FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
+            }
+            index.update_entry(&context.path, |entry| {
                 entry.last_write_time = now;
                 entry.change_time = now;
                 entry.size = new_size;
 
                 entry.fill_file_info(file_info);
-                entry.clone()
-            };
-            index.upsert_entry(&context.path, updated);
+            });
             drop(index);
 
             buf.dirty = true;
@@ -948,25 +947,26 @@ impl FileSystemContext for RemoteFilesystem {
             Ok(())
         } else {
             let mut index = self.index.write().unwrap();
-            let updated = {
-                let data = {
-                    let entry = index
-                        .get(&context.path)
-                        .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
-                    self.load_file_data(entry)
-                };
+            let data = {
                 let entry = index
-                    .get_mut(&context.path)
+                    .get(&context.path)
                     .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+                self.load_file_data(entry)
+            };
 
-                let new_len = new_size as usize;
-                let mut new_data = data;
-                if new_len < new_data.len() {
-                    new_data.truncate(new_len);
-                } else if new_len > new_data.len() {
-                    new_data.resize(new_len, 0);
-                }
+            let new_len = new_size as usize;
+            let mut new_data = data;
+            if new_len < new_data.len() {
+                new_data.truncate(new_len);
+            } else if new_len > new_data.len() {
+                new_data.resize(new_len, 0);
+            }
 
+            if !index.contains_path(&context.path) {
+                return Err(FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
+            }
+
+            index.update_entry(&context.path, |entry| {
                 // Update timestamps on size change
                 let now = current_filetime();
                 entry.last_write_time = now;
@@ -983,10 +983,7 @@ impl FileSystemContext for RemoteFilesystem {
                 }
 
                 entry.fill_file_info(file_info);
-                entry.clone()
-            };
-
-            index.upsert_entry(&context.path, updated);
+            });
             drop(index);
             self.persist_index();
             Ok(())
@@ -1089,20 +1086,17 @@ impl FileSystemContext for RemoteFilesystem {
 
                 let now = current_filetime();
                 let mut index = self.index.write().unwrap();
-                let updated = {
-                    let entry = index
-                        .get_mut(&context.path)
-                        .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
-
+                if !index.contains_path(&context.path) {
+                    return Err(FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
+                }
+                index.update_entry(&context.path, |entry| {
                     entry.last_access_time = now;
                     entry.last_write_time = now;
                     entry.change_time = now;
                     entry.size = data.len() as u64;
 
                     entry.fill_file_info(file_info);
-                    entry.clone()
-                };
-                index.upsert_entry(&context.path, updated);
+                });
                 drop(index);
 
                 buf.dirty = true;
@@ -1116,22 +1110,19 @@ impl FileSystemContext for RemoteFilesystem {
             }
             data[write_offset..write_offset + buffer.len()].copy_from_slice(buffer);
 
-            let now = current_filetime();
-            let mut index = self.index.write().unwrap();
-            let updated = {
-                let entry = index
-                    .get_mut(&context.path)
-                    .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+                let now = current_filetime();
+                let mut index = self.index.write().unwrap();
+                if !index.contains_path(&context.path) {
+                    return Err(FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
+                }
+                index.update_entry(&context.path, |entry| {
+                    entry.last_access_time = now;
+                    entry.last_write_time = now;
+                    entry.change_time = now;
+                    entry.size = data.len() as u64;
 
-                entry.last_access_time = now;
-                entry.last_write_time = now;
-                entry.change_time = now;
-                entry.size = data.len() as u64;
-
-                entry.fill_file_info(file_info);
-                entry.clone()
-            };
-            index.upsert_entry(&context.path, updated);
+                    entry.fill_file_info(file_info);
+                });
             drop(index);
 
             buf.dirty = true;
@@ -1145,9 +1136,9 @@ impl FileSystemContext for RemoteFilesystem {
                     .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
                 self.load_file_data(entry)
             };
-            let entry = index
-                .get_mut(&context.path)
-                .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+            if !index.contains_path(&context.path) {
+                return Err(FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
+            }
 
             let write_offset = if write_to_eof {
                 data.len()
@@ -1164,6 +1155,34 @@ impl FileSystemContext for RemoteFilesystem {
                 data[write_offset..write_offset + write_len].copy_from_slice(&buffer[..write_len]);
 
                 let now = current_filetime();
+                index.update_entry(&context.path, |entry| {
+                    entry.last_access_time = now;
+                    entry.last_write_time = now;
+                    entry.change_time = now;
+                    entry.size = data.len() as u64;
+
+                    if !data.is_empty() {
+                        let id = self.object_store.put(&data);
+                        entry.object_id = Some(id);
+                    } else {
+                        entry.object_id = None;
+                    }
+
+                    entry.fill_file_info(file_info);
+                });
+                drop(index);
+                self.persist_index();
+                return Ok(write_len as u32);
+            }
+
+            let end = write_offset.saturating_add(buffer.len());
+            if end > data.len() {
+                data.resize(end, 0);
+            }
+            data[write_offset..write_offset + buffer.len()].copy_from_slice(buffer);
+
+            let now = current_filetime();
+            index.update_entry(&context.path, |entry| {
                 entry.last_access_time = now;
                 entry.last_write_time = now;
                 entry.change_time = now;
@@ -1177,35 +1196,7 @@ impl FileSystemContext for RemoteFilesystem {
                 }
 
                 entry.fill_file_info(file_info);
-                let updated = entry.clone();
-                index.upsert_entry(&context.path, updated);
-                drop(index);
-                self.persist_index();
-                return Ok(write_len as u32);
-            }
-
-            let end = write_offset.saturating_add(buffer.len());
-            if end > data.len() {
-                data.resize(end, 0);
-            }
-            data[write_offset..write_offset + buffer.len()].copy_from_slice(buffer);
-
-            let now = current_filetime();
-            entry.last_access_time = now;
-            entry.last_write_time = now;
-            entry.change_time = now;
-            entry.size = data.len() as u64;
-
-            if !data.is_empty() {
-                let id = self.object_store.put(&data);
-                entry.object_id = Some(id);
-            } else {
-                entry.object_id = None;
-            }
-
-            entry.fill_file_info(file_info);
-            let updated = entry.clone();
-            index.upsert_entry(&context.path, updated);
+            });
             drop(index);
             self.persist_index();
             Ok(buffer.len() as u32)
@@ -1273,7 +1264,7 @@ impl FileSystemContext for RemoteFilesystem {
         };
         all_entries.push(("..".to_string(), dotdot_entry));
 
-        for (path, entry) in index.entries().iter() {
+        for (path, entry) in index.iter() {
             if path == dir_path {
                 continue;
             }
@@ -1337,13 +1328,13 @@ impl FileSystemContext for RemoteFilesystem {
         );
 
         let mut index = self.index.write().unwrap();
-        let entries_exist = index.entries().contains_key(&old_path);
+        let entries_exist = index.contains_path(&old_path);
 
         if !entries_exist {
             return Err(FspError::from(STATUS_OBJECT_NAME_NOT_FOUND));
         }
 
-        if index.entries().contains_key(&new_path) && !replace_if_exists {
+        if index.contains_path(&new_path) && !replace_if_exists {
             return Err(FspError::from(STATUS_INVALID_DEVICE_REQUEST));
         }
 
