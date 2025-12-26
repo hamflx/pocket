@@ -65,7 +65,7 @@ pub struct RemoteFilesystem {
     index_store: Option<Arc<dyn IndexStore>>,
     index_persister: Option<IndexPersister>,
     process_name_cache: RwLock<HashMap<u32, String>>,
-    file_buffers: RwLock<HashMap<String, Arc<Mutex<FileBuffer>>>>,
+    file_buffers: FileBufferManager,
 }
 
 #[derive(Debug)]
@@ -73,6 +73,45 @@ struct FileBuffer {
     data: Vec<u8>,
     dirty: bool,
     deleted: bool,
+}
+
+#[derive(Debug)]
+struct FileBufferManager {
+    buffers: RwLock<HashMap<String, Arc<Mutex<FileBuffer>>>>,
+}
+
+impl FileBufferManager {
+    fn new() -> Self {
+        FileBufferManager {
+            buffers: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn get_or_create<F>(&self, path: &str, make: F) -> Arc<Mutex<FileBuffer>>
+    where
+        F: FnOnce() -> FileBuffer,
+    {
+        {
+            let read = self.buffers.read().unwrap();
+            if let Some(buf) = read.get(path) {
+                return buf.clone();
+            }
+        }
+
+        let mut write = self.buffers.write().unwrap();
+        if let Some(buf) = write.get(path) {
+            return buf.clone();
+        }
+
+        let buf = Arc::new(Mutex::new(make()));
+        write.insert(path.to_string(), buf.clone());
+        buf
+    }
+
+    fn remove(&self, path: &str) {
+        let mut write = self.buffers.write().unwrap();
+        write.remove(path);
+    }
 }
 
 #[derive(Clone)]
@@ -169,7 +208,7 @@ impl RemoteFilesystem {
                                 index_store: Some(idx),
                                 index_persister,
                                 process_name_cache: RwLock::new(HashMap::new()),
-                                file_buffers: RwLock::new(HashMap::new()),
+                                file_buffers: FileBufferManager::new(),
                             });
                         }
                     };
@@ -241,7 +280,7 @@ impl RemoteFilesystem {
             index_store,
             index_persister,
             process_name_cache: RwLock::new(HashMap::new()),
-            file_buffers: RwLock::new(HashMap::new()),
+            file_buffers: FileBufferManager::new(),
         })
     }
 
@@ -432,6 +471,34 @@ impl RemoteFilesystem {
         Vec::new()
     }
 
+    fn flush_buffer_if_needed(&self, path: &str, buf: &mut FileBuffer) {
+        if !buf.dirty || buf.deleted {
+            return;
+        }
+
+        let data = &buf.data;
+        let mut index = self.index.write().unwrap();
+        if let Some(entry) = index.get_mut(path) {
+            let now = current_filetime();
+            entry.last_write_time = now;
+            entry.change_time = now;
+            entry.size = data.len() as u64;
+
+            if !data.is_empty() {
+                let id = self.object_store.put(data);
+                entry.object_id = Some(id);
+            } else {
+                entry.object_id = None;
+            }
+
+            let updated = entry.clone();
+            index.upsert_entry(path, updated);
+            drop(index);
+            buf.dirty = false;
+            self.persist_index();
+        }
+    }
+
     fn persist_index(&self) {
         if let Some(persister) = &self.index_persister {
             persister.request_persist();
@@ -507,19 +574,12 @@ impl FileSystemContext for RemoteFilesystem {
             debug!("open: file_info: {:?}", fi);
 
             let buffer = if Self::should_buffer_file(&path, entry.is_dir) {
-                let mut buffers = self.file_buffers.write().unwrap();
-                if let Some(buf) = buffers.get(&path) {
-                    Some(buf.clone())
-                } else {
-                    let data = self.load_file_data(entry);
-                    let buf = Arc::new(Mutex::new(FileBuffer {
-                        data,
-                        dirty: false,
-                        deleted: false,
-                    }));
-                    buffers.insert(path.clone(), buf.clone());
-                    Some(buf)
-                }
+                let data = self.load_file_data(entry);
+                Some(self.file_buffers.get_or_create(&path, || FileBuffer {
+                    data,
+                    dirty: false,
+                    deleted: false,
+                }))
             } else {
                 None
             };
@@ -553,31 +613,7 @@ impl FileSystemContext for RemoteFilesystem {
                 }
             };
 
-            if !buf.dirty || buf.deleted {
-                return;
-            }
-
-            let data = &buf.data;
-            let mut index = self.index.write().unwrap();
-            if let Some(entry) = index.get_mut(&context.path) {
-                let now = current_filetime();
-                entry.last_write_time = now;
-                entry.change_time = now;
-                entry.size = data.len() as u64;
-
-                if !data.is_empty() {
-                    let id = self.object_store.put(data);
-                    entry.object_id = Some(id);
-                } else {
-                    entry.object_id = None;
-                }
-
-                let updated = entry.clone();
-                index.upsert_entry(&context.path, updated);
-                drop(index);
-                buf.dirty = false;
-                self.persist_index();
-            }
+            self.flush_buffer_if_needed(&context.path, &mut buf);
         }
     }
 
@@ -670,18 +706,11 @@ impl FileSystemContext for RemoteFilesystem {
         self.persist_index();
 
         let buffer = if Self::should_buffer_file(&path, resulting_is_dir) && !resulting_is_dir {
-            let mut buffers = self.file_buffers.write().unwrap();
-            if let Some(buf) = buffers.get(&path) {
-                Some(buf.clone())
-            } else {
-                let buf = Arc::new(Mutex::new(FileBuffer {
-                    data: Vec::new(),
-                    dirty: false,
-                    deleted: false,
-                }));
-                buffers.insert(path.clone(), buf.clone());
-                Some(buf)
-            }
+            Some(self.file_buffers.get_or_create(&path, || FileBuffer {
+                data: Vec::new(),
+                dirty: false,
+                deleted: false,
+            }))
         } else {
             None
         };
@@ -717,8 +746,7 @@ impl FileSystemContext for RemoteFilesystem {
             self.persist_index();
 
             // 删除时清理共享缓冲。
-            let mut buffers = self.file_buffers.write().unwrap();
-            buffers.remove(&path);
+            self.file_buffers.remove(&path);
             return;
         }
 
@@ -733,31 +761,7 @@ impl FileSystemContext for RemoteFilesystem {
                 }
             };
 
-            if !buf.dirty || buf.deleted {
-                return;
-            }
-
-            let data = &buf.data;
-            let mut index = self.index.write().unwrap();
-            if let Some(entry) = index.get_mut(&context.path) {
-                let now = current_filetime();
-                entry.last_write_time = now;
-                entry.change_time = now;
-                entry.size = data.len() as u64;
-
-                if !data.is_empty() {
-                    let id = self.object_store.put(data);
-                    entry.object_id = Some(id);
-                } else {
-                    entry.object_id = None;
-                }
-
-                let updated = entry.clone();
-                index.upsert_entry(&context.path, updated);
-                drop(index);
-                buf.dirty = false;
-                self.persist_index();
-            }
+            self.flush_buffer_if_needed(&context.path, &mut buf);
         }
     }
 
