@@ -18,6 +18,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install WinFsp (filesystem driver)
+        run: choco install winfsp -y
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -46,4 +49,3 @@ jobs:
           files: dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-

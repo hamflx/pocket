@@ -21,6 +21,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install WinFsp (filesystem driver)
+        run: choco install winfsp -y
+
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -34,4 +37,3 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked
-
