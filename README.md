@@ -39,7 +39,9 @@ The configuration file has two main parts:
 - `storages` – named backends (memory or S3).
 - `mounts` – local directories to mount, each bound to a storage.
 
-Pocket expands `~`, `$HOME` and `${HOME}` inside `mount_path`.
+Pocket expands the following inside `mount_path`:
+- `~` – user's home directory
+- `$VAR` or `${VAR}` – any environment variable (e.g. `$APPDATA`, `${USERPROFILE}`)
 
 ### Minimal in‑memory example
 

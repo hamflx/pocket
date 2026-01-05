@@ -112,28 +112,111 @@ fn home_dir_string() -> Option<String> {
     None
 }
 
-/// Expand "~", "$HOME" and "${HOME}" in a mount path using the current user's
-/// home directory. If the home directory cannot be determined, the original
-/// string is returned unchanged.
+/// Expand "~" to home directory and environment variables ($VAR or ${VAR}) in a mount path.
+/// If the home directory cannot be determined for "~", it is left unchanged.
+/// Unknown environment variables are left unchanged.
 pub fn expand_mount_path(path: &str) -> String {
-    let Some(home) = home_dir_string() else {
-        return path.to_string();
-    };
+    let mut expanded = path.to_string();
 
     // Handle leading "~" (e.g. "~/.ssh" or "~\pocket").
-    let mut expanded = if path == "~" {
-        home.clone()
-    } else if path.starts_with("~/") || path.starts_with("~\\") {
-        format!("{home}{}", &path[1..])
-    } else {
-        path.to_string()
-    };
+    if let Some(home) = home_dir_string() {
+        if expanded == "~" {
+            expanded = home;
+        } else if expanded.starts_with("~/") || expanded.starts_with("~\\") {
+            expanded = format!("{home}{}", &expanded[1..]);
+        }
+    }
 
-    // Substitute $HOME and ${HOME} anywhere in the path.
-    expanded = expanded.replace("$HOME", &home);
-    expanded = expanded.replace("${HOME}", &home);
+    // Expand ${VAR} style environment variables first (more specific pattern).
+    expanded = expand_env_vars_braced(&expanded);
+
+    // Expand $VAR style environment variables.
+    expanded = expand_env_vars_simple(&expanded);
 
     expanded
+}
+
+/// Expand ${VAR} style environment variables in a string.
+fn expand_env_vars_braced(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '$' && chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+            let mut var_name = String::new();
+            let mut found_close = false;
+
+            for ch in chars.by_ref() {
+                if ch == '}' {
+                    found_close = true;
+                    break;
+                }
+                var_name.push(ch);
+            }
+
+            if found_close && !var_name.is_empty() {
+                if let Ok(value) = std::env::var(&var_name) {
+                    result.push_str(&value);
+                } else {
+                    // Variable not found, keep original
+                    result.push_str(&format!("${{{}}}", var_name));
+                }
+            } else {
+                // Malformed, keep original
+                result.push('$');
+                result.push('{');
+                result.push_str(&var_name);
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
+}
+
+/// Expand $VAR style environment variables in a string.
+/// Supports $VAR at any position, variable name ends at non-alphanumeric/non-underscore.
+fn expand_env_vars_simple(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            // Check if next char starts a valid variable name (letter or underscore)
+            if let Some(&next) = chars.peek() {
+                if next.is_ascii_alphabetic() || next == '_' {
+                    let mut var_name = String::new();
+
+                    while let Some(&ch) = chars.peek() {
+                        if ch.is_ascii_alphanumeric() || ch == '_' {
+                            var_name.push(ch);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    if !var_name.is_empty() {
+                        if let Ok(value) = std::env::var(&var_name) {
+                            result.push_str(&value);
+                        } else {
+                            // Variable not found, keep original
+                            result.push('$');
+                            result.push_str(&var_name);
+                        }
+                        continue;
+                    }
+                }
+            }
+            result.push(c);
+        } else {
+            result.push(c);
+        }
+    }
+
+    result
 }
 
 pub fn load_config() -> AppConfig {
@@ -211,5 +294,70 @@ mod tests {
         let mounts = effective_mounts(&cfg).unwrap();
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].0.name.as_deref(), Some("mem"));
+    }
+
+    #[test]
+    fn test_expand_env_vars_braced() {
+        // Set a test environment variable
+        unsafe { std::env::set_var("POCKET_TEST_VAR", "test_value") };
+
+        // Test ${VAR} style
+        assert_eq!(
+            expand_mount_path("${POCKET_TEST_VAR}/config"),
+            "test_value/config"
+        );
+        assert_eq!(
+            expand_mount_path("prefix/${POCKET_TEST_VAR}/suffix"),
+            "prefix/test_value/suffix"
+        );
+
+        // Unknown variable should be kept as-is
+        assert_eq!(
+            expand_mount_path("${UNKNOWN_VAR_12345}/path"),
+            "${UNKNOWN_VAR_12345}/path"
+        );
+
+        unsafe { std::env::remove_var("POCKET_TEST_VAR") };
+    }
+
+    #[test]
+    fn test_expand_env_vars_simple() {
+        // Set a test environment variable
+        unsafe { std::env::set_var("POCKET_TEST_VAR2", "simple_value") };
+
+        // Test $VAR style
+        assert_eq!(
+            expand_mount_path("$POCKET_TEST_VAR2/config"),
+            "simple_value/config"
+        );
+        assert_eq!(
+            expand_mount_path("prefix/$POCKET_TEST_VAR2/suffix"),
+            "prefix/simple_value/suffix"
+        );
+
+        // Unknown variable should be kept as-is
+        assert_eq!(
+            expand_mount_path("$UNKNOWN_VAR_67890/path"),
+            "$UNKNOWN_VAR_67890/path"
+        );
+
+        unsafe { std::env::remove_var("POCKET_TEST_VAR2") };
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        // Test ~ expansion (depends on HOME/USERPROFILE being set)
+        let expanded = expand_mount_path("~/.ssh");
+        assert!(!expanded.starts_with('~'), "~ should be expanded");
+        assert!(expanded.ends_with("/.ssh") || expanded.ends_with("\\.ssh"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_expand_appdata() {
+        // On Windows, $APPDATA should be expanded
+        let expanded = expand_mount_path("$APPDATA/nushell");
+        assert!(!expanded.starts_with('$'), "APPDATA should be expanded");
+        assert!(expanded.contains("AppData") || expanded.contains("appdata"));
     }
 }
